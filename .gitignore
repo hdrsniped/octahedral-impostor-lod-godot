@@ -1,0 +1,10 @@
+# Godot 4 & editor artifacts
+.godot/
+*.translation
+
+# Archives
+*.zip
+
+# OS / Editor
+.DS_Store
+Thumbs.db
