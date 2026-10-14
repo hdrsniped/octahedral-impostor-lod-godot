@@ -136,10 +136,7 @@ Automated tests live in `tests/` (see the comments at the top of each file).
 
 ## License and credit
 
-Free for private and commercial use. **Credit is required**: any game or product
-that uses this plugin must credit **hdrsniped** as the author of Octahedral
-Impostor LOD (for example in its credits screen or documentation).
-Full terms in [LICENSE](LICENSE).
+Free for private and commercial use. **Credit is required** Full terms in [LICENSE](LICENSE).
 
 Made by **hdrsniped**.
 
