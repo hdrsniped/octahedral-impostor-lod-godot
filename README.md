@@ -1,9 +1,10 @@
-# Octahedral Impostor LOD for Godot 4
+# Octahedral Impostor LOD for Godot 4 ( for now )
 
 Turn heavy 3D objects into lightweight **octahedral impostors**: one flat, camera-facing
 card per object that looks like the real model from any angle. Up close you see
 the real mesh; farther away the card takes over automatically. A whole forest of
 30,000-triangle rocks becomes 2 triangles per rock in the distance.
+
 
 - **One click in the editor**: select objects, *Octahedral Impostor LOD > Bake Selected...*, done.
 - **Automatic LOD switching** with Godot's built-in visibility ranges (no script per frame).
@@ -12,10 +13,12 @@ the real mesh; farther away the card takes over automatically. A whole forest of
 - **Batches well**: every card from one atlas shares a single material; MultiMesh supported.
 - **Fully undoable**, works with Forward+ and Mobile renderers.
 
-> Measured on a laptop iGPU: 4,000 rocks as real meshes ~388 ms per frame;
+> Measured on a vega 7 windows system: 4,000 rocks as real meshes ~388 ms per frame;
 > as High-quality impostors ~6 ms; as Low ~1 ms.
 
 ## When to use it
+
+what makes this different?: normally, on a fast moving games the LOD failed to deliver a good visual; with this racing games can enjoy it too, long live optimization!
 
 | Good fit | Poor fit |
 | --- | --- |
