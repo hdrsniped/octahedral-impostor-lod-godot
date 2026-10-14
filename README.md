@@ -26,10 +26,12 @@ the real mesh; farther away the card takes over automatically. A whole forest of
 
 ## Install
 
-1. Copy the `addons/octahedral_impostor_lod` folder into your project's `addons/` folder
-   (or install it from the Godot Asset Library).
-2. *Project > Project Settings > Plugins*: enable **Octahedral Impostor LOD**.
-3. A **Octahedral Impostor LOD** menu appears in the 3D editor's toolbar.
+1. Download the latest `octahedral-impostor-lod-godot-vX.Y.Z.zip` from the
+   [Releases](https://github.com/hdrsniped/octahedral-impostor-lod-godot/releases) page.
+2. Unzip it into your Godot project folder. It contains the
+   `addons/octahedral_impostor_lod` folder.
+3. *Project > Project Settings > Plugins*: enable **Octahedral Impostor LOD**.
+4. An **Octahedral Impostor LOD** menu appears in the 3D editor's toolbar.
 
 Requires Godot **4.7** or newer.
 
