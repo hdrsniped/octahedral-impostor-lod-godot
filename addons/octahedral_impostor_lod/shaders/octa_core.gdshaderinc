@@ -4,11 +4,13 @@ render_mode cull_disabled, depth_draw_opaque;
 #ifndef QUALITY
 #define QUALITY 1
 #endif
-#define MAX_OBJECTS 256
 #if QUALITY == 0
 #define NUM_FRAMES 1
 #else
 #define NUM_FRAMES 3
+#endif
+#ifndef DEBUG_MODE
+#define DEBUG_MODE 0
 #endif
 #if QUALITY >= 2
 #define PARALLAX_STEPS 3
@@ -20,12 +22,18 @@ render_mode cull_disabled, depth_draw_opaque;
 group_uniforms atlas;
 uniform sampler2D albedo_atlas : source_color, filter_linear_mipmap, repeat_disable;
 uniform sampler2D normal_atlas : filter_linear_mipmap, repeat_disable;
+uniform sampler2D obj_data : filter_nearest, repeat_disable;
+uniform sampler2D orm_atlas : hint_default_white, filter_linear_mipmap, repeat_disable;
+uniform sampler2D emission_atlas : hint_default_black, filter_linear_mipmap, repeat_disable;
+uniform bool use_orm = false;
+uniform bool use_emission = false;
 uniform int grid_size = 12;
-uniform ivec2 tiles = ivec2(1, 1);
 uniform bool hemisphere = true;
 uniform float frame_scale = 1.0;
-uniform vec4 obj_bounds[MAX_OBJECTS];
-uniform vec4 obj_surface[MAX_OBJECTS];
+#if QUALITY == 3
+uniform sampler2D back_atlas : filter_linear_mipmap, repeat_disable;
+uniform bool use_back_layer = false;
+#endif
 
 group_uniforms look;
 uniform vec4 tint : source_color = vec4(1.0);
@@ -34,9 +42,18 @@ uniform float normal_strength : hint_range(0.0, 1.0) = 1.0;
 uniform float depth_scale : hint_range(0.0, 2.0) = 1.0;
 uniform float quad_offset : hint_range(0.0, 1.0) = 1.0;
 uniform float shadow_bias : hint_range(0.0, 0.5) = 0.04;
+#if QUALITY == 3
+group_uniforms complex_shapes;
+uniform int search_steps : hint_range(2, 32) = 8;
+uniform int refine_steps : hint_range(0, 8) = 3;
+uniform float layer_tolerance : hint_range(0.0, 1.0) = 0.15;
+uniform float min_thickness : hint_range(0.0, 1.0) = 0.1;
+#endif
 group_uniforms;
 
 instance uniform int octa_index = 0;
+instance uniform vec4 card_tint : source_color = vec4(1.0);
+instance uniform float card_depth = 1.0;
 
 varying vec3 v_ray;
 varying vec3 v_pos;
@@ -45,8 +62,11 @@ varying flat vec4 v_f01;
 varying flat vec2 v_f2;
 varying flat vec4 v_bounds;
 varying flat vec4 v_surf;
-varying flat vec2 v_tile;
+varying flat vec4 v_rect;
+varying flat vec4 v_mat;
 varying flat mat3 v_nmat;
+varying flat vec3 v_tint;
+varying flat float v_depth;
 
 // --- View direction math ---
 vec2 sign_nz(vec2 v) {
@@ -99,13 +119,13 @@ vec2 frame_uv(vec3 p, vec3 x, vec3 y) {
 }
 
 vec2 atlas_uv(vec2 frame, vec2 uv) {
-	return (v_tile + (frame + clamp(uv, 0.0, 1.0)) / float(grid_size)) / vec2(tiles);
+	return v_rect.xy + (frame + clamp(uv, 0.0, 1.0)) / float(grid_size) * v_rect.zw;
 }
 
 // --- Vertex: face the camera, pick the 3 nearest views ---
 void vertex() {
-	int idx = clamp(octa_index, 0, MAX_OBJECTS - 1);
-	vec4 b = obj_bounds[idx];
+	int idx = max(octa_index, 0);
+	vec4 b = texelFetch(obj_data, ivec2(0, idx), 0);
 	float r = max(b.w, 1e-5);
 	mat4 inv_model = inverse(MODEL_MATRIX);
 	v_nmat = transpose(mat3(inv_model));
@@ -164,15 +184,48 @@ void vertex() {
 	v_f2 = f2;
 #endif
 	v_bounds = vec4(b.xyz, r);
-	v_surf = obj_surface[idx];
-	v_tile = vec2(float(idx % tiles.x), float(idx / tiles.x));
+	v_surf = texelFetch(obj_data, ivec2(1, idx), 0);
+	v_rect = texelFetch(obj_data, ivec2(2, idx), 0);
+	v_mat = texelFetch(obj_data, ivec2(3, idx), 0);
+	bool joined = INSTANCE_CUSTOM.a > 0.0;
+	v_tint = tint.rgb * (joined ? INSTANCE_CUSTOM.rgb : card_tint.rgb);
+	v_depth = depth_scale * (joined ? INSTANCE_CUSTOM.a : card_depth);
 }
+
+// --- Fragment helpers ---
+float baked_height(vec4 nd) {
+	return nd.a > 0.01 ? (1.0 - 2.0 * nd.b / nd.a) * v_depth : 0.0;
+}
+
+#if QUALITY == 3
+bool in_frame(vec2 u) {
+	return all(greaterThanEqual(u, vec2(0.0))) && all(lessThanEqual(u, vec2(1.0)));
+}
+
+bool is_inside(vec3 p, vec3 d, vec2 u, vec4 nd, float back, bool front_only) {
+	if (!in_frame(u) || nd.a < 0.5) {
+		return false;
+	}
+	float hf = (1.0 - 2.0 * nd.b / nd.a) * v_depth;
+	float hb = -2.0;
+	if (use_back_layer && !front_only) {
+		hb = min((1.0 - 2.0 * back / nd.a) * v_depth, hf - min_thickness);
+	}
+	float ph = dot(p, d);
+	return ph <= hf && ph >= hb;
+}
+
+bool crossed_slab(vec3 p, vec3 p_prev, vec3 d, vec2 u, vec4 nd, float back) {
+	if (!use_back_layer || !in_frame(u) || nd.a < 0.5) {
+		return false;
+	}
+	float hf = (1.0 - 2.0 * nd.b / nd.a) * v_depth;
+	float hb = min((1.0 - 2.0 * back / nd.a) * v_depth, hf - min_thickness);
+	return dot(p_prev, d) > hf && dot(p, d) < hb;
+}
+#endif
 
 // --- Fragment: blend views, parallax, per-pixel depth ---
-float baked_height(vec4 nd) {
-	return nd.a > 0.01 ? (1.0 - 2.0 * nd.b / nd.a) * depth_scale : 0.0;
-}
-
 void fragment() {
 	vec3 rd = normalize(v_ray);
 	vec3 ro = v_pos;
@@ -195,7 +248,7 @@ void fragment() {
 		rod[i] = dot(ro, fd[i]);
 		uv[i] = frame_uv(ro - rd * (rod[i] / denom[i]), fx[i], fy[i]);
 	}
-	vec2 to_atlas = 1.0 / (float(grid_size) * vec2(tiles));
+	vec2 to_atlas = v_rect.zw / float(grid_size);
 	vec2 gx = dFdx(uv[0]) * to_atlas;
 	vec2 gy = dFdy(uv[0]) * to_atlas;
 
@@ -213,9 +266,105 @@ void fragment() {
 	}
 
 	vec4 acc_a = vec4(0.0);
+	vec4 acc_o = vec4(0.0);
+	vec4 acc_e = vec4(0.0);
 	vec3 acc_n = vec3(0.0);
 	vec3 acc_p = vec3(0.0);
 	float acc_cov = 0.0;
+#if QUALITY == 3
+	float bq = dot(ro, rd);
+	float disc = bq * bq - dot(ro, ro) + 1.0;
+	if (disc <= 0.0) {
+		discard;
+	}
+	float t_in = -bq - sqrt(disc);
+	float t_out = -bq + sqrt(disc);
+	float dt = (t_out - t_in) / float(max(search_steps, 1));
+	float th[3] = float[3](0.0, 0.0, 0.0);
+	float hit[3] = float[3](0.0, 0.0, 0.0);
+	vec4 nh[3];
+	vec2 uh[3];
+	float t_ref = -1e9;
+	for (int i = 0; i < NUM_FRAMES; i++) {
+		nh[i] = vec4(0.0);
+		uh[i] = vec2(0.0);
+		if (wt[i] <= 0.0001) {
+			continue;
+		}
+		float lo = t_in;
+		float hi = t_in;
+		bool front_only = false;
+		for (int s = 0; s <= search_steps; s++) {
+			float t = t_in + dt * float(s);
+			vec3 p = ro + rd * t;
+			vec2 u = frame_uv(p, fx[i], fy[i]);
+			vec2 a = atlas_uv(fr[i], u);
+			vec4 n4 = textureGrad(normal_atlas, a, gx, gy);
+			float bk = use_back_layer ? textureGrad(back_atlas, a, gx, gy).r : 0.0;
+			bool crossed = s > 0 && crossed_slab(p, p - rd * dt, fd[i], u, n4, bk);
+			if (crossed || is_inside(p, fd[i], u, n4, bk, false)) {
+				front_only = crossed;
+				hit[i] = 1.0;
+				hi = t;
+				nh[i] = n4;
+				uh[i] = u;
+				break;
+			}
+			lo = t;
+		}
+		if (hit[i] < 0.5) {
+			continue;
+		}
+		for (int r = 0; r < refine_steps; r++) {
+			float t = (lo + hi) * 0.5;
+			vec3 p = ro + rd * t;
+			vec2 u = frame_uv(p, fx[i], fy[i]);
+			vec2 a = atlas_uv(fr[i], u);
+			vec4 n4 = textureGrad(normal_atlas, a, gx, gy);
+			float bk = use_back_layer ? textureGrad(back_atlas, a, gx, gy).r : 0.0;
+			if (is_inside(p, fd[i], u, n4, bk, front_only)) {
+				hi = t;
+				nh[i] = n4;
+				uh[i] = u;
+			} else {
+				lo = t;
+			}
+		}
+		th[i] = hi;
+		t_ref = max(t_ref, hi);
+	}
+	float wsum = 0.0;
+	for (int i = 0; i < NUM_FRAMES; i++) {
+		if (wt[i] <= 0.0001) {
+			continue;
+		}
+		float w = wt[i];
+		if (hit[i] > 0.5 && layer_tolerance > 0.0) {
+			w *= 1.0 - smoothstep(layer_tolerance * 0.5, layer_tolerance, t_ref - th[i]);
+		}
+		wsum += w;
+		if (hit[i] < 0.5 || w <= 0.0001) {
+			continue;
+		}
+		float cov = nh[i].a * w;
+		acc_cov += cov;
+		acc_p += (ro + rd * th[i]) * cov;
+		if (!IN_SHADOW_PASS) {
+			acc_a += textureGrad(albedo_atlas, atlas_uv(fr[i], uh[i]), gx, gy) * w;
+			if (use_orm) {
+				acc_o += textureGrad(orm_atlas, atlas_uv(fr[i], uh[i]), gx, gy) * w;
+			}
+			if (use_emission) {
+				acc_e += textureGrad(emission_atlas, atlas_uv(fr[i], uh[i]), gx, gy) * w;
+			}
+			vec2 nxy = nh[i].xy / nh[i].a * 2.0 - 1.0;
+			acc_n += (fx[i] * nxy.x + fy[i] * nxy.y + fd[i] * sqrt(max(1.0 - dot(nxy, nxy), 0.0))) * cov;
+		}
+	}
+	if (acc_cov / max(wsum, 1e-4) < max(alpha_cut, 1e-4)) {
+		discard;
+	}
+#else
 	for (int i = 0; i < NUM_FRAMES; i++) {
 		if (wt[i] <= 0.0001) {
 			continue;
@@ -232,6 +381,12 @@ void fragment() {
 		acc_p += (ro + rd * ((baked_height(n4) - rod[i]) / denom[i])) * cov;
 		if (!IN_SHADOW_PASS) {
 			acc_a += textureGrad(albedo_atlas, atlas_uv(fr[i], u), gx, gy) * w;
+			if (use_orm) {
+				acc_o += textureGrad(orm_atlas, atlas_uv(fr[i], u), gx, gy) * w;
+			}
+			if (use_emission) {
+				acc_e += textureGrad(emission_atlas, atlas_uv(fr[i], u), gx, gy) * w;
+			}
 			vec2 nxy = n4.a > 0.0 ? n4.xy / n4.a * 2.0 - 1.0 : vec2(0.0);
 			acc_n += (fx[i] * nxy.x + fy[i] * nxy.y + fd[i] * sqrt(max(1.0 - dot(nxy, nxy), 0.0))) * cov;
 		}
@@ -239,19 +394,51 @@ void fragment() {
 	if (acc_cov < max(alpha_cut, 1e-4)) {
 		discard;
 	}
-	ALBEDO = acc_a.rgb / max(acc_a.a, 1e-4) * tint.rgb;
+#endif
+	ALBEDO = acc_a.rgb / max(acc_a.a, 1e-4) * v_tint;
 	vec3 n_view = normalize(mat3(VIEW_MATRIX) * normalize(v_nmat * acc_n));
 	NORMAL = normalize(mix(NORMAL, n_view, normal_strength));
 	ROUGHNESS = v_surf.x;
 	METALLIC = v_surf.y;
 	SPECULAR = v_surf.z;
+	if (use_orm) {
+		vec3 orm = acc_o.rgb / max(acc_o.a, 1e-4);
+		AO = orm.r;
+		AO_LIGHT_AFFECT = v_mat.y;
+		ROUGHNESS = orm.g;
+		METALLIC = orm.b;
+	}
+	if (use_emission) {
+		EMISSION = acc_e.rgb / max(acc_e.a, 1e-4) * v_mat.x;
+	}
 	vec3 p_l = acc_p / acc_cov;
 	if (IN_SHADOW_PASS) {
 		p_l += rd * shadow_bias;
 	}
 	vec3 p_obj = v_bounds.xyz + p_l * v_bounds.w;
 	vec4 p_view = VIEW_MATRIX * (MODEL_MATRIX * vec4(p_obj, 1.0));
+#ifndef NO_DEPTH_WRITE
 	vec4 clip = PROJECTION_MATRIX * p_view;
+#if CURRENT_RENDERER == RENDERER_COMPATIBILITY
+	DEPTH = clip.z / clip.w * 0.5 + 0.5;
+#else
 	DEPTH = clip.z / clip.w;
+#endif
+#endif
+#if DEBUG_MODE == 1
+	vec3 lod_color = QUALITY == 0 ? vec3(1.0, 0.2, 0.2) : (QUALITY == 1 ? vec3(1.0, 0.65, 0.1) : (QUALITY == 2 ? vec3(0.2, 1.0, 0.3) : vec3(0.2, 0.8, 1.0)));
+	ALBEDO = mix(ALBEDO, lod_color, 0.6);
+#elif DEBUG_MODE == 2
+	float hue = fract(v_f01.x * 0.618034 + v_f01.y * 0.381966);
+	vec3 view_color = clamp(abs(fract(hue + vec3(0.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0) - 1.0, 0.0, 1.0);
+	ALBEDO = vec3(0.0);
+	EMISSION = view_color;
+#elif DEBUG_MODE == 3
+	ALBEDO = vec3(0.0);
+	EMISSION = vec3(clamp(dot(p_l, -rd) * 0.5 + 0.5, 0.0, 1.0));
+#elif DEBUG_MODE == 4
+	ALBEDO = vec3(0.0);
+	EMISSION = use_orm ? acc_o.rgb / max(acc_o.a, 1e-4) : vec3(1.0, v_surf.x, v_surf.y);
+#endif
 	LIGHT_VERTEX = p_view.xyz;
 }

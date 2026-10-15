@@ -2,7 +2,6 @@ class_name DemoObjects
 extends RefCounted
 
 
-# --- Procedural test objects ---
 static func rock(seed_value := 1) -> Node3D:
 	var sphere := SphereMesh.new()
 	sphere.radius = 1.0
@@ -49,53 +48,33 @@ static func rock(seed_value := 1) -> Node3D:
 static func tree() -> Node3D:
 	var root := Node3D.new()
 	root.name = "Tree"
+	var bark := StandardMaterial3D.new()
+	bark.albedo_color = Color(0.36, 0.24, 0.14)
+	bark.roughness = 0.9
 	var trunk := MeshInstance3D.new()
 	var cyl := CylinderMesh.new()
-	cyl.top_radius = 0.12
-	cyl.bottom_radius = 0.22
-	cyl.height = 2.2
-	cyl.radial_segments = 48
+	cyl.top_radius = 0.14
+	cyl.bottom_radius = 0.24
+	cyl.height = 2.0
+	cyl.radial_segments = 24
 	trunk.mesh = cyl
-	trunk.position.y = 1.1
-	var bark := StandardMaterial3D.new()
-	bark.albedo_color = Color(0.40, 0.26, 0.15)
+	trunk.position.y = 1.0
 	trunk.material_override = bark
 	root.add_child(trunk)
-	var leaf_mat := StandardMaterial3D.new()
-	leaf_mat.albedo_color = Color(0.22, 0.55, 0.18)
-	leaf_mat.roughness = 0.7
-	var blobs := [Vector3(0, 2.4, 0), Vector3(0.55, 2.0, 0.2), Vector3(-0.5, 2.1, -0.25), Vector3(0.1, 2.0, -0.55), Vector3(-0.15, 1.9, 0.55)]
-	for i in blobs.size():
-		var b := MeshInstance3D.new()
-		var s := SphereMesh.new()
-		s.radius = 0.55 - i * 0.04
-		s.height = s.radius * 2.0
-		s.radial_segments = 64
-		s.rings = 32
-		b.mesh = s
-		b.position = blobs[i]
-		b.material_override = leaf_mat
-		root.add_child(b)
-	var img := Image.create_empty(64, 64, false, Image.FORMAT_RGBA8)
-	for y in 64:
-		for x in 64:
-			var u := (x - 32) / 32.0
-			var v := y / 64.0
-			var inside := absf(u) < (1.0 - v) * 0.6 * (0.6 + 0.4 * sin(v * 40.0))
-			img.set_pixel(x, y, Color(0.35, 0.7, 0.2, 1.0 if inside else 0.0))
-	var frond_mat := StandardMaterial3D.new()
-	frond_mat.albedo_texture = ImageTexture.create_from_image(img)
-	frond_mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA_SCISSOR
-	frond_mat.cull_mode = BaseMaterial3D.CULL_DISABLED
-	for i in 3:
-		var q := MeshInstance3D.new()
-		var qm := QuadMesh.new()
-		qm.size = Vector2(0.9, 0.9)
-		q.mesh = qm
-		q.material_override = frond_mat
-		q.position = Vector3(0, 0.45, 0)
-		q.rotation.y = i * PI / 3.0
-		root.add_child(q)
+	var leaf := StandardMaterial3D.new()
+	leaf.albedo_color = Color(0.2, 0.5, 0.2)
+	leaf.roughness = 0.8
+	for i in 4:
+		var cone := MeshInstance3D.new()
+		var cm := CylinderMesh.new()
+		cm.top_radius = 0.0
+		cm.bottom_radius = 1.0 - i * 0.2
+		cm.height = 1.1
+		cm.radial_segments = 24
+		cone.mesh = cm
+		cone.position.y = 1.7 + i * 0.6
+		cone.material_override = leaf
+		root.add_child(cone)
 	return root
 
 
@@ -103,21 +82,22 @@ static func rings() -> Node3D:
 	var root := Node3D.new()
 	root.name = "Rings"
 	var colors := [Color(0.8, 0.15, 0.1), Color(0.95, 0.75, 0.2), Color(0.15, 0.35, 0.85)]
+	var axes := [Vector3(0, 0, 0), Vector3(PI / 2.0, 0, 0), Vector3(0, 0, PI / 2.0)]
 	for i in 3:
 		var t := MeshInstance3D.new()
 		var tm := TorusMesh.new()
-		tm.inner_radius = 0.55
-		tm.outer_radius = 0.8
-		tm.rings = 96
-		tm.ring_segments = 32
+		tm.inner_radius = 0.7
+		tm.outer_radius = 0.9
+		tm.rings = 64
+		tm.ring_segments = 24
 		t.mesh = tm
 		var m := StandardMaterial3D.new()
 		m.albedo_color = colors[i]
 		m.metallic = 0.6
-		m.roughness = 0.35
+		m.roughness = 0.3
 		t.material_override = m
 		t.position.y = 0.9
-		t.rotation = Vector3(PI / 2.0, i * PI / 3.0, 0)
+		t.rotation = axes[i]
 		root.add_child(t)
 	return root
 

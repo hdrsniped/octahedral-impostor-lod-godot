@@ -22,5 +22,9 @@ run lod_forward    -s res://tests/lod_test.gd
 run lod_mobile     --rendering-method mobile -s res://tests/lod_test.gd
 run lod_compat     --rendering-method gl_compatibility -s res://tests/lod_test.gd
 run visual         -s res://tests/visual_test.gd
+run debug          -s res://tests/debug_test.gd
+run quality_flat   -s res://tests/quality_flat_test.gd
+echo "== cli"
+bash tests/cli_test.sh "$GODOT"
 echo "== editor"
 bash tests/run_editor_test.sh "$GODOT"

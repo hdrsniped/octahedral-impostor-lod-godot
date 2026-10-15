@@ -19,5 +19,9 @@ void fragment() {
 	}
 	vec3 n = normalize(NORMAL);
 	float depth = clamp((-VERTEX.z - (cam_dist - radius)) / (2.0 * radius), 0.0, 1.0);
+#ifdef BACK_PASS
+	ALBEDO = vec3(depth);
+#else
 	ALBEDO = vec3(n.xy * 0.5 + 0.5, depth);
+#endif
 }

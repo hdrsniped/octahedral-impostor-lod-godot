@@ -82,7 +82,7 @@ func _run() -> void:
 		mmi.multimesh = mm
 		root.add_child(mmi)
 	else:
-		var q: int = {"low": 0, "medium": 1, "high": 2}.get(mode, 2)
+		var q: int = {"low": 0, "medium": 1, "high": 2, "ultra": 3}.get(mode, 2)
 		var atlas: OctaAtlas = await OctaBaker.bake([DemoObjects.rock(1)], root)
 		root.add_child(atlas.create_multimesh(0, transforms, q))
 

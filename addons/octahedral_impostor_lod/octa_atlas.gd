@@ -2,31 +2,94 @@
 class_name OctaAtlas
 extends Resource
 
-enum Quality { LOW, MEDIUM, HIGH }
+enum Quality { LOW, MEDIUM, HIGH, ULTRA }
 
 const SHADERS := [
 	preload("res://addons/octahedral_impostor_lod/shaders/octa_low.gdshader"),
 	preload("res://addons/octahedral_impostor_lod/shaders/octa_medium.gdshader"),
 	preload("res://addons/octahedral_impostor_lod/shaders/octa_high.gdshader"),
+	preload("res://addons/octahedral_impostor_lod/shaders/octa_ultra.gdshader"),
 ]
-const MAX_OBJECTS := 256
+const SHADER_INCLUDE := "res://addons/octahedral_impostor_lod/shaders/octa_core.gdshaderinc"
+const MAX_OBJECTS := 1024
+const FORMAT_VERSION := 3
 const CARD_META := &"octa_card"
 
+@export var format_version := 1
 @export var albedo: Texture2D
 @export var normal_depth: Texture2D
+@export var back_depth: Texture2D
+@export var orm: Texture2D
+@export var emission: Texture2D
 @export var grid_size := 12
 @export var hemisphere := true
+@export var parent_space := false
 @export var tiles := Vector2i.ONE
 @export var frame_resolution := 128
 @export var frame_scale := 1.0
+@export var write_depth := true:
+	set(v):
+		write_depth = v
+		for q in materials.size():
+			if materials[q] != null:
+				materials[q].shader = shader_for(q, write_depth)
 @export var object_names := PackedStringArray()
 @export var bounds := PackedVector4Array()
 @export var surface_params := PackedVector4Array()
-@export var materials: Array[ShaderMaterial] = [null, null, null]
+@export var material_params := PackedVector4Array()
+@export var materials: Array[ShaderMaterial] = [null, null, null, null]
 @export var meshes: Array[Mesh] = []
+@export var bake_settings: OctaBakeSettings
+
+var _obj_data: ImageTexture
+
+static var _variants := {}
+static var _live: Array[WeakRef] = []
 
 
 # --- Materials, meshes and cards ---
+static func shader_for(quality: int, depth: bool = true, debug: int = -1) -> Shader:
+	if debug < 0:
+		debug = OctaDebug.mode
+	if depth and debug == 0:
+		return SHADERS[quality]
+	var key := quality * 100 + (10 if depth else 0) + debug
+	if not _variants.has(key):
+		var s := Shader.new()
+		s.code = "shader_type spatial;\n#define QUALITY %d\n%s#define DEBUG_MODE %d\n#include \"%s\"\n" % [quality, "" if depth else "#define NO_DEPTH_WRITE\n", debug, SHADER_INCLUDE]
+		_variants[key] = s
+	return _variants[key]
+
+
+static func live_atlases() -> Array[OctaAtlas]:
+	var keep: Array[WeakRef] = []
+	var out: Array[OctaAtlas] = []
+	for w in _live:
+		var a := w.get_ref() as OctaAtlas
+		if a != null:
+			keep.append(w)
+			out.append(a)
+	_live = keep
+	return out
+
+
+static func refresh_all_materials() -> void:
+	for a in live_atlases():
+		for q in a.materials.size():
+			if a.materials[q] != null:
+				a.materials[q].shader = shader_for(q, a.write_depth)
+
+
+func vram_bytes() -> int:
+	var total := 0.0
+	for t: Texture2D in [albedo, normal_depth, orm, emission]:
+		if t != null:
+			total += t.get_width() * t.get_height() * 4.0 * 4.0 / 3.0
+	if back_depth != null:
+		total += back_depth.get_width() * back_depth.get_height() * 4.0 / 3.0
+	return int(total)
+
+
 func object_count() -> int:
 	return bounds.size()
 
@@ -36,12 +99,15 @@ func index_of(object_name: String) -> int:
 
 
 func get_material(quality: Quality = Quality.HIGH) -> ShaderMaterial:
-	if materials.size() < 3:
-		materials.resize(3)
+	if materials.size() < SHADERS.size():
+		materials.resize(SHADERS.size())
 	if materials[quality] == null:
-		var m := ShaderMaterial.new()
-		m.shader = SHADERS[quality]
-		materials[quality] = m
+		materials[quality] = ShaderMaterial.new()
+	if not _live.any(func(w: WeakRef) -> bool: return w.get_ref() == self):
+		_live.append(weakref(self))
+	var want := shader_for(quality, write_depth)
+	if materials[quality].shader != want:
+		materials[quality].shader = want
 	_apply_params(materials[quality])
 	return materials[quality]
 
@@ -50,11 +116,40 @@ func _apply_params(m: ShaderMaterial) -> void:
 	m.set_shader_parameter("albedo_atlas", albedo)
 	m.set_shader_parameter("normal_atlas", normal_depth)
 	m.set_shader_parameter("grid_size", grid_size)
-	m.set_shader_parameter("tiles", tiles)
 	m.set_shader_parameter("hemisphere", hemisphere)
 	m.set_shader_parameter("frame_scale", frame_scale)
-	m.set_shader_parameter("obj_bounds", bounds)
-	m.set_shader_parameter("obj_surface", surface_params)
+	m.set_shader_parameter("obj_data", object_data())
+	m.set_shader_parameter("orm_atlas", orm)
+	m.set_shader_parameter("use_orm", orm != null)
+	m.set_shader_parameter("emission_atlas", emission)
+	m.set_shader_parameter("use_emission", emission != null)
+	if m.shader == shader_for(Quality.ULTRA, write_depth):
+		m.set_shader_parameter("back_atlas", back_depth)
+		m.set_shader_parameter("use_back_layer", back_depth != null)
+
+
+func object_data() -> ImageTexture:
+	if _obj_data != null and _obj_data.get_height() == maxi(object_count(), 1):
+		return _obj_data
+	var img := Image.create_empty(4, maxi(object_count(), 1), false, Image.FORMAT_RGBAF)
+	var cols := maxi(tiles.x, 1)
+	var cell := Vector2.ONE / Vector2(maxi(tiles.x, 1), maxi(tiles.y, 1))
+	for i in object_count():
+		var b := bounds[i]
+		var sp := surface_params[i] if i < surface_params.size() else Vector4(0.9, 0.0, 0.5, 0.0)
+		var at := Vector2(i % cols, i / cols) * cell
+		img.set_pixel(0, i, Color(b.x, b.y, b.z, b.w))
+		img.set_pixel(1, i, Color(sp.x, sp.y, sp.z, sp.w))
+		img.set_pixel(2, i, Color(at.x, at.y, cell.x, cell.y))
+		if i < material_params.size():
+			var mp := material_params[i]
+			img.set_pixel(3, i, Color(mp.x, mp.y, mp.z, mp.w))
+	_obj_data = ImageTexture.create_from_image(img)
+	return _obj_data
+
+
+func card_transform(source: Node3D) -> Transform3D:
+	return Transform3D(Basis.IDENTITY, source.position) if parent_space else source.transform
 
 
 func get_mesh(index: int) -> Mesh:
@@ -70,23 +165,25 @@ func get_mesh(index: int) -> Mesh:
 	return meshes[index]
 
 
-func create_card(index: int, quality: Quality = Quality.HIGH) -> MeshInstance3D:
-	var mi := MeshInstance3D.new()
-	mi.name = "OctaImpostor"
-	mi.set_meta(CARD_META, true)
-	mi.mesh = get_mesh(index)
-	mi.material_override = get_material(quality)
-	mi.set_instance_shader_parameter("octa_index", index)
-	return mi
+func create_card(index: int, quality: Quality = Quality.HIGH) -> OctaImpostor:
+	var card := OctaImpostor.new()
+	card.name = "OctaImpostor"
+	card.quality = quality
+	card.object_index = index
+	card.atlas = self
+	return card
 
 
-func create_multimesh(index: int, transforms: Array, quality: Quality = Quality.HIGH) -> MultiMeshInstance3D:
+func create_multimesh(index: int, transforms: Array, quality: Quality = Quality.HIGH, customs: Array = []) -> MultiMeshInstance3D:
 	var mm := MultiMesh.new()
 	mm.transform_format = MultiMesh.TRANSFORM_3D
+	mm.use_custom_data = not customs.is_empty()
 	mm.mesh = get_mesh(index)
 	mm.instance_count = transforms.size()
 	for i in transforms.size():
 		mm.set_instance_transform(i, transforms[i])
+		if mm.use_custom_data:
+			mm.set_instance_custom_data(i, customs[i])
 	var mmi := MultiMeshInstance3D.new()
 	mmi.name = "ImpostorMultiMesh"
 	mmi.multimesh = mm

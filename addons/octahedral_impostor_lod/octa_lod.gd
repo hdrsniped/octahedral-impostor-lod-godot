@@ -8,39 +8,55 @@ enum Mode {
 	REPLACE,
 }
 
+enum LodMode {
+	DISTANCE,
+	SCREEN_SIZE,
+}
+
+enum Fade {
+	NONE,
+	CROSSFADE,
+}
+
+const DEFAULT_FOV := 75.0
 const SOURCE_META := &"octa_source"
 const MODE_META := &"octa_mode"
 
 
 # --- Generate and attach ---
-static func generate(sources: Array, host: Node, settings: OctaBakeSettings = null, save_path := "") -> OctaAtlas:
+static func generate(sources: Array, host: Node, settings: OctaBakeSettings = null, save_path := "", job: OctaBakeJob = null) -> OctaAtlas:
 	if settings == null:
 		settings = OctaBakeSettings.new()
+	if settings.split_parts:
+		sources = split_parts(sources)
 	var atlas: OctaAtlas
 	if save_path.is_empty():
-		atlas = await OctaBaker.bake(sources, host, settings)
+		atlas = await OctaBaker.bake(sources, host, settings, job)
 	else:
-		atlas = await OctaBaker.bake_to_file(sources, host, save_path, settings)
+		atlas = await OctaBaker.bake_to_file(sources, host, save_path, settings, job)
 	if atlas != null:
 		for i in sources.size():
-			attach_card(sources[i], atlas, i, settings.mode, settings.lod_distance, settings.quality)
+			attach_card(sources[i], atlas, i, settings.mode, settings.lod_distance, settings.quality, null, settings)
 	return atlas
 
 
 static func attach_card(source: Node3D, atlas: OctaAtlas, index: int, mode := Mode.DYNAMIC_LOD,
-		lod_distance := 40.0, quality := OctaAtlas.Quality.HIGH, owner: Node = null) -> MeshInstance3D:
+		lod_distance := 40.0, quality := OctaAtlas.Quality.HIGH, owner: Node = null, settings: OctaBakeSettings = null) -> MeshInstance3D:
 	var card := atlas.create_card(index, quality)
 	if is_child_card(source, mode):
 		source.add_child(card, true)
 	else:
 		card.name = String(source.name) + "_OctaImpostor"
-		card.transform = source.transform
+		card.transform = atlas.card_transform(source)
 		source.get_parent().add_child(card, true)
 	card.set_meta(SOURCE_META, card.get_path_to(source))
 	card.set_meta(MODE_META, mode)
+	if settings != null:
+		card.configure(settings, world_scale(card))
 	if mode == Mode.DYNAMIC_LOD:
-		card.visibility_range_begin = lod_distance
-		card.visibility_range_begin_margin = 1.0
+		if settings == null:
+			card.visibility_range_begin = lod_distance
+			card.visibility_range_begin_margin = 1.0
 		for gi in geometry_below(source):
 			gi.visibility_parent = gi.get_path_to(card)
 	elif mode == Mode.REPLACE:
@@ -50,12 +66,69 @@ static func attach_card(source: Node3D, atlas: OctaAtlas, index: int, mode := Mo
 	return card
 
 
+static func signature(node: Node3D) -> String:
+	var parts := PackedStringArray()
+	for gi in geometry_below(node):
+		if gi is MeshInstance3D and gi.mesh != null:
+			var mats := PackedStringArray()
+			for s in gi.mesh.get_surface_count():
+				var m: Material = gi.get_active_material(s)
+				mats.append(str(m.get_instance_id() if m != null else 0))
+			var rel := node.global_transform.affine_inverse() * gi.global_transform
+			parts.append("%d|%s|%s" % [gi.mesh.get_instance_id(), rel, ",".join(mats)])
+	return ";".join(parts)
+
+
+static func scene_candidates(root: Node, lod_distance: float) -> Array:
+	var out := []
+	_gather_candidates(root, lod_distance, out)
+	return out
+
+
+static func _gather_candidates(node: Node, lod: float, out: Array) -> void:
+	for c: Node in node.get_children():
+		if c.has_meta(OctaAtlas.CARD_META) or (c is Node3D and not c.visible):
+			continue
+		if not c is Node3D:
+			_gather_candidates(c, lod, out)
+			continue
+		var geo := geometry_below(c).filter(func(g: Node) -> bool: return g is MeshInstance3D and g.mesh != null)
+		if geo.is_empty():
+			_gather_candidates(c, lod, out)
+			continue
+		var radius: float = OctaBaker._collect(c).bounds.w
+		var tris := 0
+		for g in geo:
+			tris += g.mesh.get_faces().size() / 3
+		var pct := screen_size_for_distance(radius, lod)
+		out.append({node = c, pct = pct, tris = tris, cards = find_cards(c).size()})
+
+
+static func split_parts(sources: Array) -> Array[Node3D]:
+	var out: Array[Node3D] = []
+	for s: Node3D in sources:
+		for gi in geometry_below(s):
+			if gi is MeshInstance3D and gi.mesh != null and gi.visible and not out.has(gi):
+				out.append(gi)
+	return out
+
+
 # --- Remove ---
 static func remove_cards(source: Node3D) -> void:
 	for card in find_cards(source):
 		_restore(source, card)
 		card.get_parent().remove_child(card)
 		card.queue_free()
+
+
+static func find_cards_below(source: Node) -> Array[Node3D]:
+	var out := find_cards(source)
+	for gi in geometry_below(source):
+		if gi != source:
+			for c in find_cards(gi):
+				if not out.has(c):
+					out.append(c)
+	return out
 
 
 static func find_cards(source: Node) -> Array[Node3D]:
@@ -67,6 +140,41 @@ static func find_cards(source: Node) -> Array[Node3D]:
 		if n is Node3D and n.has_meta(OctaAtlas.CARD_META) and n.get_node_or_null(n.get_meta(SOURCE_META, NodePath(".."))) == source:
 			out.append(n)
 	return out
+
+
+# --- Screen size and fade ---
+static func default_fov() -> float:
+	return float(ProjectSettings.get_setting("octa_lod/reference_fov", DEFAULT_FOV))
+
+
+static func distance_for_screen_size(radius: float, percent: float, fov_deg := -1.0) -> float:
+	if percent <= 0.0:
+		return 0.0
+	var fov := fov_deg if fov_deg > 0.0 else default_fov()
+	return radius / (percent / 100.0 * tan(deg_to_rad(fov) * 0.5))
+
+
+static func screen_size_for_distance(radius: float, distance: float, fov_deg := -1.0) -> float:
+	if distance <= 0.0:
+		return 100.0
+	var fov := fov_deg if fov_deg > 0.0 else default_fov()
+	return radius / (distance * tan(deg_to_rad(fov) * 0.5)) * 100.0
+
+
+static func world_scale(node: Node) -> float:
+	var s := 1.0
+	var n := node
+	while n != null:
+		if n is Node3D:
+			var sc: Vector3 = (n as Node3D).transform.basis.get_scale().abs()
+			s *= maxf(sc.x, maxf(sc.y, sc.z))
+		n = n.get_parent()
+	return s
+
+
+static func fade_supported() -> bool:
+	var method := String(ProjectSettings.get_setting("rendering/renderer/rendering_method", "forward_plus")) if Engine.is_editor_hint() else RenderingServer.get_current_rendering_method()
+	return method == "forward_plus"
 
 
 # --- Helpers ---

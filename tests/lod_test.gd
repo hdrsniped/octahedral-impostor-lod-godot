@@ -78,8 +78,70 @@ func _run() -> void:
 		var want_card := dist > LOD_DIST
 		_check((red > 0.5) == want_card, "rock at %.0f m shows %s (red %.2f)" % [dist, "card" if red > 0.5 else "mesh", red])
 
+	atlas.write_depth = false
+	for i in 6:
+		await RenderingServer.frame_post_draw
+	var flat_img := vp.get_texture().get_image()
+	var flat_ok := true
+	for i in rocks.size():
+		var b := atlas.bounds[0]
+		var px := Vector2i(cam.unproject_position(rocks[i].global_transform * Vector3(b.x, b.y, b.z)))
+		var dist := cam.global_position.distance_to(rocks[i].global_transform * Vector3(b.x, b.y, b.z))
+		flat_ok = flat_ok and (_red_fraction(flat_img, px, 6) > 0.5) == (dist > LOD_DIST)
+	_check(flat_ok and atlas.get_material(OctaAtlas.Quality.HIGH).shader.code.contains("NO_DEPTH_WRITE"), "cards without depth write render and switch like before")
+	atlas.write_depth = true
+
 	for r in rocks:
 		r.queue_free()
+	for i in 3:
+		await RenderingServer.frame_post_draw
+	var fs := OctaBakeSettings.new()
+	fs.lod_distance = 40.0
+	fs.fade = OctaLOD.Fade.CROSSFADE
+	fs.fade_margin = 10.0
+	var frock := DemoObjects.rock(3)
+	frock.position = Vector3(0, 0, 44)
+	frock.scale = Vector3.ONE * 44.0 / 12.0
+	vp.add_child(frock)
+	var fcard: OctaImpostor = OctaLOD.attach_card(frock, atlas, 0, OctaLOD.Mode.DYNAMIC_LOD, 40.0, OctaAtlas.Quality.HIGH, null, fs)
+	var fmode_ok := fcard.visibility_range_fade_mode == (GeometryInstance3D.VISIBILITY_RANGE_FADE_SELF if OctaLOD.fade_supported() else GeometryInstance3D.VISIBILITY_RANGE_FADE_DISABLED)
+	_check(fmode_ok and absf(fcard.visibility_range_begin - 40.0) < 0.001 and absf(fcard.visibility_range_begin_margin - (10.0 if OctaLOD.fade_supported() else 1.0)) < 0.001, "DYNAMIC_LOD card gets fade mode and margin (supported here: %s)" % OctaLOD.fade_supported())
+	for i in 6:
+		await RenderingServer.frame_post_draw
+	var fimg := vp.get_texture().get_image()
+	var fb := atlas.bounds[0]
+	var fpx := Vector2i(cam.unproject_position(frock.global_transform * Vector3(fb.x, fb.y, fb.z)))
+	var fred := _red_fraction(fimg, fpx, 6)
+	if OctaLOD.fade_supported():
+		_check(fred > 0.1 and fred < 0.95, "card and mesh are dithered together inside the fade zone (card share %.2f)" % fred)
+	else:
+		_check(fred > 0.95 or fred < 0.05, "no fade renderer pops between mesh and card (card share %.2f)" % fred)
+	frock.queue_free()
+	var dsrc := DemoObjects.tree()
+	vp.add_child(dsrc)
+	var dcard: OctaImpostor = OctaLOD.attach_card(dsrc, atlas, 1, OctaLOD.Mode.DUPLICATE, 0.0, OctaAtlas.Quality.HIGH, null, fs)
+	dcard.lod_distance = 40.0
+	_check(dcard.visibility_range_fade_mode == (GeometryInstance3D.VISIBILITY_RANGE_FADE_SELF if OctaLOD.fade_supported() else GeometryInstance3D.VISIBILITY_RANGE_FADE_DISABLED), "DUPLICATE card can fade in once it has a LOD distance")
+	var rsrc := DemoObjects.tree()
+	vp.add_child(rsrc)
+	var rcard: OctaImpostor = OctaLOD.attach_card(rsrc, atlas, 1, OctaLOD.Mode.REPLACE, 40.0, OctaAtlas.Quality.HIGH, null, fs)
+	_check(rcard.visibility_range_fade_mode == GeometryInstance3D.VISIBILITY_RANGE_FADE_DISABLED and rcard.visibility_range_begin == 0.0 and not rsrc.visible, "REPLACE card ignores fade (no real mesh to fade)")
+	var ss := OctaBakeSettings.new()
+	ss.lod_mode = OctaLOD.LodMode.SCREEN_SIZE
+	ss.lod_screen_percent = 8.0
+	var ssrc := DemoObjects.rock(3)
+	ssrc.scale = Vector3.ONE * 2.0
+	vp.add_child(ssrc)
+	var scard: OctaImpostor = OctaLOD.attach_card(ssrc, atlas, 0, OctaLOD.Mode.DYNAMIC_LOD, 40.0, OctaAtlas.Quality.HIGH, null, ss)
+	var srad := atlas.bounds[0].w * 2.0
+	_check(absf(OctaLOD.screen_size_for_distance(srad, scard.visibility_range_begin) - 8.0) < 0.01, "screen size LOD card: %.1f%% of the screen height at %.1f m" % [8.0, scard.visibility_range_begin])
+	for n in [dsrc, rsrc, ssrc]:
+		n.queue_free()
+	for c in vp.get_children():
+		if c is OctaImpostor:
+			c.queue_free()
+	for i in 3:
+		await RenderingServer.frame_post_draw
 	var xfs := []
 	for i in 500:
 		xfs.append(Transform3D(Basis(), Vector3((i % 25 - 12) * 3.0, 0, 20 + (i / 25) * 3.0)))
