@@ -102,5 +102,55 @@ static func rings() -> Node3D:
 	return root
 
 
+static func textured() -> Node3D:
+	var size := 256
+	var albedo := Image.create_empty(size, size, false, Image.FORMAT_RGB8)
+	var rough := Image.create_empty(size, size, false, Image.FORMAT_L8)
+	var metal := Image.create_empty(size, size, false, Image.FORMAT_L8)
+	var occlusion := Image.create_empty(size, size, false, Image.FORMAT_L8)
+	var glow := Image.create_empty(size, size, false, Image.FORMAT_RGB8)
+	var noise := FastNoiseLite.new()
+	noise.seed = 7
+	noise.frequency = 0.03
+	noise.fractal_octaves = 3
+	for y in size:
+		for x in size:
+			var n := noise.get_noise_2d(x, y) * 0.5 + 0.5
+			var cell := (x / 32 + y / 32) % 2
+			var plate := 1.0 if (x % 32 < 3 or y % 32 < 3) else 0.0
+			albedo.set_pixel(x, y, Color(0.55, 0.28, 0.12).lerp(Color(0.75, 0.72, 0.65), float(cell)).lerp(Color(0.2, 0.2, 0.22), plate) * (0.7 + 0.3 * n))
+			rough.set_pixel(x, y, Color.from_hsv(0.0, 0.0, clampf(0.25 + 0.6 * n + 0.15 * float(cell) - 0.2 * plate, 0.0, 1.0)))
+			metal.set_pixel(x, y, Color.from_hsv(0.0, 0.0, 1.0 if (cell == 1 or plate > 0.5) else 0.0))
+			occlusion.set_pixel(x, y, Color.from_hsv(0.0, 0.0, 1.0 - 0.6 * plate - 0.2 * (1.0 - n)))
+			var d := Vector2(x % 64, y % 64).distance_to(Vector2(32, 32))
+			glow.set_pixel(x, y, Color(1.0, 0.55, 0.1) if (d < 7.0 and (x / 64 + y / 64) % 2 == 0) else Color.BLACK)
+	var mat := StandardMaterial3D.new()
+	mat.albedo_texture = ImageTexture.create_from_image(albedo)
+	mat.roughness_texture = ImageTexture.create_from_image(rough)
+	mat.roughness_texture_channel = BaseMaterial3D.TEXTURE_CHANNEL_RED
+	mat.metallic_texture = ImageTexture.create_from_image(metal)
+	mat.metallic_texture_channel = BaseMaterial3D.TEXTURE_CHANNEL_RED
+	mat.ao_enabled = true
+	mat.ao_texture = ImageTexture.create_from_image(occlusion)
+	mat.ao_texture_channel = BaseMaterial3D.TEXTURE_CHANNEL_RED
+	mat.emission_enabled = true
+	mat.emission_texture = ImageTexture.create_from_image(glow)
+	mat.emission_energy_multiplier = 2.0
+	mat.uv1_scale = Vector3(3, 2, 1)
+	var sphere := SphereMesh.new()
+	sphere.radius = 1.0
+	sphere.height = 2.0
+	sphere.radial_segments = 96
+	sphere.rings = 48
+	sphere.material = mat
+	var mi := MeshInstance3D.new()
+	mi.mesh = sphere
+	mi.position.y = 1.0
+	var root := Node3D.new()
+	root.name = "Textured"
+	root.add_child(mi)
+	return root
+
+
 static func all() -> Array:
 	return [rock(), tree(), rings()]

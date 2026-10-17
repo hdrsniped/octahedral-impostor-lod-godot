@@ -12,10 +12,35 @@ render_mode cull_disabled, depth_draw_opaque;
 #ifndef DEBUG_MODE
 #define DEBUG_MODE 0
 #endif
+#if DEBUG_MODE == 5
+#define WASTE_PIXEL wasted = true;
+#ifndef NO_DEPTH_WRITE
+#define NO_DEPTH_WRITE
+#endif
+#else
+#define WASTE_PIXEL discard;
+#endif
+// --- Thresholds ---
+const float COARSE_MIN = 0.001;
+const float PIXEL_VALID = 0.01;
+const float PIXEL_SOLID = 0.5;
+const float WEIGHT_MIN = 0.0001;
+const float MAX_CARD_SCALE = 8.0;
+const float COARSE_LOD_SCALE = 8.0;
+const float MIN_CAMERA_GAP = 0.02;
+const float SPHERE_EDGE = 1.001;
+const float POLE_DOT = 0.999;
 #if QUALITY >= 2
 #define PARALLAX_STEPS 3
 #else
 #define PARALLAX_STEPS 1
+#endif
+#define SHADOW_STEPS 2
+#if QUALITY == 3 && defined(PRECISE_SEARCH)
+#define SEARCH_SUB 4
+const float PROBE_MIN = 0.05;
+const float PROBE_SOLID = 0.95;
+const float PROBE_MAX_LOD = 5.0;
 #endif
 
 // --- Uniforms ---
@@ -42,6 +67,7 @@ uniform float normal_strength : hint_range(0.0, 1.0) = 1.0;
 uniform float depth_scale : hint_range(0.0, 2.0) = 1.0;
 uniform float quad_offset : hint_range(0.0, 1.0) = 1.0;
 uniform float shadow_bias : hint_range(0.0, 0.5) = 0.04;
+uniform int shadow_views : hint_range(1, 3) = 1;
 #if QUALITY == 3
 group_uniforms complex_shapes;
 uniform int search_steps : hint_range(2, 32) = 8;
@@ -109,7 +135,7 @@ vec3 frame_dir(vec2 frame) {
 }
 
 void frame_basis(vec3 d, out vec3 x, out vec3 y) {
-	vec3 up = abs(d.y) > 0.999 ? vec3(0.0, 0.0, -1.0) : vec3(0.0, 1.0, 0.0);
+	vec3 up = abs(d.y) > POLE_DOT ? vec3(0.0, 0.0, -1.0) : vec3(0.0, 1.0, 0.0);
 	x = normalize(cross(up, d));
 	y = cross(d, x);
 }
@@ -141,9 +167,9 @@ void vertex() {
 	float s = 1.0;
 	if (!ortho) {
 		float dist = length(cam_l);
-		off = clamp(off, 0.0, max(dist - 0.02, 0.0));
-		s = dist > 1.001 ? (dist - off) / sqrt(dist * dist - 1.0) : 8.0;
-		s = min(s, 8.0);
+		off = clamp(off, 0.0, max(dist - MIN_CAMERA_GAP, 0.0));
+		s = dist > SPHERE_EDGE ? (dist - off) / sqrt(dist * dist - 1.0) : MAX_CARD_SCALE;
+		s = min(s, MAX_CARD_SCALE);
 	}
 	vec3 pos_l = view_dir * off + (bx * VERTEX.x + by * VERTEX.y) * s;
 	v_pos = pos_l;
@@ -194,7 +220,7 @@ void vertex() {
 
 // --- Fragment helpers ---
 float baked_height(vec4 nd) {
-	return nd.a > 0.01 ? (1.0 - 2.0 * nd.b / nd.a) * v_depth : 0.0;
+	return nd.a > PIXEL_VALID ? (1.0 - 2.0 * nd.b / nd.a) * v_depth : 0.0;
 }
 
 #if QUALITY == 3
@@ -203,7 +229,7 @@ bool in_frame(vec2 u) {
 }
 
 bool is_inside(vec3 p, vec3 d, vec2 u, vec4 nd, float back, bool front_only) {
-	if (!in_frame(u) || nd.a < 0.5) {
+	if (!in_frame(u) || nd.a < PIXEL_SOLID) {
 		return false;
 	}
 	float hf = (1.0 - 2.0 * nd.b / nd.a) * v_depth;
@@ -216,7 +242,7 @@ bool is_inside(vec3 p, vec3 d, vec2 u, vec4 nd, float back, bool front_only) {
 }
 
 bool crossed_slab(vec3 p, vec3 p_prev, vec3 d, vec2 u, vec4 nd, float back) {
-	if (!use_back_layer || !in_frame(u) || nd.a < 0.5) {
+	if (!use_back_layer || !in_frame(u) || nd.a < PIXEL_SOLID) {
 		return false;
 	}
 	float hf = (1.0 - 2.0 * nd.b / nd.a) * v_depth;
@@ -225,6 +251,20 @@ bool crossed_slab(vec3 p, vec3 p_prev, vec3 d, vec2 u, vec4 nd, float back) {
 }
 #endif
 
+// --- Shadow pass: coverage and depth from one baked view ---
+float shadow_view(vec2 frame, vec3 d, vec3 bx, vec3 by, vec3 ro, vec3 rd, vec2 gx, vec2 gy, out vec3 pos) {
+	float den = min(dot(rd, d), -1e-4);
+	float rod = dot(ro, d);
+	vec2 u = frame_uv(ro - rd * (rod / den), bx, by);
+	vec4 n4 = textureGrad(normal_atlas, atlas_uv(frame, u), gx * COARSE_LOD_SCALE, gy * COARSE_LOD_SCALE);
+	for (int s = 0; s < SHADOW_STEPS; s++) {
+		u = frame_uv(ro + rd * ((baked_height(n4) - rod) / den), bx, by);
+		n4 = textureGrad(normal_atlas, atlas_uv(frame, u), gx, gy);
+	}
+	pos = ro + rd * ((baked_height(n4) - rod) / den);
+	return n4.a * float(all(greaterThanEqual(u, vec2(0.0))) && all(lessThanEqual(u, vec2(1.0))));
+}
+
 // --- Fragment: blend views, parallax, per-pixel depth ---
 void fragment() {
 	vec3 rd = normalize(v_ray);
@@ -232,124 +272,205 @@ void fragment() {
 	vec2 fr[3] = vec2[3](v_f01.xy, v_f01.zw, v_f2);
 	float wt[3] = float[3](v_w.x, v_w.y, v_w.z);
 	if (IN_SHADOW_PASS) {
-		wt = float[3](1.0, 0.0, 0.0);
-	}
-
-	vec3 fx[3];
-	vec3 fy[3];
-	vec3 fd[3];
-	vec2 uv[3];
-	float denom[3];
-	float rod[3];
-	for (int i = 0; i < NUM_FRAMES; i++) {
-		fd[i] = frame_dir(fr[i]);
-		frame_basis(fd[i], fx[i], fy[i]);
-		denom[i] = min(dot(rd, fd[i]), -1e-4);
-		rod[i] = dot(ro, fd[i]);
-		uv[i] = frame_uv(ro - rd * (rod[i] / denom[i]), fx[i], fy[i]);
-	}
-	vec2 to_atlas = v_rect.zw / float(grid_size);
-	vec2 gx = dFdx(uv[0]) * to_atlas;
-	vec2 gy = dFdy(uv[0]) * to_atlas;
-
-	vec4 nd[3];
-	float coarse = 0.0;
-	for (int i = 0; i < NUM_FRAMES; i++) {
-		nd[i] = vec4(0.0);
-		if (wt[i] > 0.0001) {
-			nd[i] = textureGrad(normal_atlas, atlas_uv(fr[i], uv[i]), gx * 8.0, gy * 8.0);
-			coarse += nd[i].a * wt[i];
-		}
-	}
-	if (coarse < 0.001) {
-		discard;
-	}
-
-	vec4 acc_a = vec4(0.0);
-	vec4 acc_o = vec4(0.0);
-	vec4 acc_e = vec4(0.0);
-	vec3 acc_n = vec3(0.0);
-	vec3 acc_p = vec3(0.0);
-	float acc_cov = 0.0;
-#if QUALITY == 3
-	float bq = dot(ro, rd);
-	float disc = bq * bq - dot(ro, ro) + 1.0;
-	if (disc <= 0.0) {
-		discard;
-	}
-	float t_in = -bq - sqrt(disc);
-	float t_out = -bq + sqrt(disc);
-	float dt = (t_out - t_in) / float(max(search_steps, 1));
-	float th[3] = float[3](0.0, 0.0, 0.0);
-	float hit[3] = float[3](0.0, 0.0, 0.0);
-	vec4 nh[3];
-	vec2 uh[3];
-	float t_ref = -1e9;
-	for (int i = 0; i < NUM_FRAMES; i++) {
-		nh[i] = vec4(0.0);
-		uh[i] = vec2(0.0);
-		if (wt[i] <= 0.0001) {
-			continue;
-		}
-		float lo = t_in;
-		float hi = t_in;
-		bool front_only = false;
-		for (int s = 0; s <= search_steps; s++) {
-			float t = t_in + dt * float(s);
-			vec3 p = ro + rd * t;
-			vec2 u = frame_uv(p, fx[i], fy[i]);
-			vec2 a = atlas_uv(fr[i], u);
-			vec4 n4 = textureGrad(normal_atlas, a, gx, gy);
-			float bk = use_back_layer ? textureGrad(back_atlas, a, gx, gy).r : 0.0;
-			bool crossed = s > 0 && crossed_slab(p, p - rd * dt, fd[i], u, n4, bk);
-			if (crossed || is_inside(p, fd[i], u, n4, bk, false)) {
-				front_only = crossed;
-				hit[i] = 1.0;
-				hi = t;
-				nh[i] = n4;
-				uh[i] = u;
-				break;
+		vec2 to_a = v_rect.zw / float(grid_size);
+		vec3 d0 = frame_dir(fr[0]);
+		vec3 bx0;
+		vec3 by0;
+		frame_basis(d0, bx0, by0);
+		vec2 u0 = frame_uv(ro - rd * (dot(ro, d0) / min(dot(rd, d0), -1e-4)), bx0, by0);
+		vec2 sgx = dFdx(u0) * to_a;
+		vec2 sgy = dFdy(u0) * to_a;
+		vec3 pos_sum;
+		float cov_sum = shadow_view(fr[0], d0, bx0, by0, ro, rd, sgx, sgy, pos_sum);
+		if (shadow_views > 1) {
+			cov_sum *= wt[0];
+			pos_sum *= cov_sum;
+			for (int i = 1; i < min(shadow_views, NUM_FRAMES); i++) {
+				if (wt[i] <= WEIGHT_MIN) {
+					continue;
+				}
+				vec3 d = frame_dir(fr[i]);
+				vec3 bx;
+				vec3 by;
+				frame_basis(d, bx, by);
+				vec3 p;
+				float cv = shadow_view(fr[i], d, bx, by, ro, rd, sgx, sgy, p) * wt[i];
+				cov_sum += cv;
+				pos_sum += p * cv;
 			}
-			lo = t;
+			pos_sum /= max(cov_sum, 1e-4);
 		}
-		if (hit[i] < 0.5) {
-			continue;
+		if (cov_sum < max(alpha_cut, 1e-4)) {
+			discard;
 		}
-		for (int r = 0; r < refine_steps; r++) {
-			float t = (lo + hi) * 0.5;
-			vec3 p = ro + rd * t;
-			vec2 u = frame_uv(p, fx[i], fy[i]);
-			vec2 a = atlas_uv(fr[i], u);
-			vec4 n4 = textureGrad(normal_atlas, a, gx, gy);
-			float bk = use_back_layer ? textureGrad(back_atlas, a, gx, gy).r : 0.0;
-			if (is_inside(p, fd[i], u, n4, bk, front_only)) {
-				hi = t;
-				nh[i] = n4;
-				uh[i] = u;
-			} else {
+		vec3 ps = pos_sum + rd * shadow_bias;
+#ifndef NO_DEPTH_WRITE
+		vec4 sclip = PROJECTION_MATRIX * (VIEW_MATRIX * (MODEL_MATRIX * vec4(v_bounds.xyz + ps * v_bounds.w, 1.0)));
+#if CURRENT_RENDERER == RENDERER_COMPATIBILITY
+		DEPTH = sclip.z / sclip.w * 0.5 + 0.5;
+#else
+		DEPTH = sclip.z / sclip.w;
+#endif
+#endif
+	} else {
+		vec3 fx[3];
+		vec3 fy[3];
+		vec3 fd[3];
+		vec2 uv[3];
+		float denom[3];
+		float rod[3];
+		for (int i = 0; i < NUM_FRAMES; i++) {
+			fd[i] = frame_dir(fr[i]);
+			frame_basis(fd[i], fx[i], fy[i]);
+			denom[i] = min(dot(rd, fd[i]), -1e-4);
+			rod[i] = dot(ro, fd[i]);
+			uv[i] = frame_uv(ro - rd * (rod[i] / denom[i]), fx[i], fy[i]);
+		}
+		vec2 to_atlas = v_rect.zw / float(grid_size);
+		vec2 gx = dFdx(uv[0]) * to_atlas;
+		vec2 gy = dFdy(uv[0]) * to_atlas;
+#if DEBUG_MODE == 5
+		bool wasted = false;
+#endif
+
+		vec4 nd[3];
+		float coarse = 0.0;
+		for (int i = 0; i < NUM_FRAMES; i++) {
+			nd[i] = vec4(0.0);
+			if (wt[i] > WEIGHT_MIN) {
+				nd[i] = textureGrad(normal_atlas, atlas_uv(fr[i], uv[i]), gx * COARSE_LOD_SCALE, gy * COARSE_LOD_SCALE);
+				coarse += nd[i].a * wt[i];
+			}
+		}
+		if (coarse < COARSE_MIN) {
+			WASTE_PIXEL
+		}
+
+		vec4 acc_a = vec4(0.0);
+		vec4 acc_o = vec4(0.0);
+		vec4 acc_e = vec4(0.0);
+		vec3 acc_n = vec3(0.0);
+		vec3 acc_p = vec3(0.0);
+		float acc_cov = 0.0;
+#if QUALITY == 3
+		float bq = dot(ro, rd);
+		float disc = bq * bq - dot(ro, ro) + 1.0;
+		if (disc <= 0.0) {
+			WASTE_PIXEL
+		}
+		float t_in = -bq - sqrt(disc);
+		float t_out = -bq + sqrt(disc);
+		float dt = (t_out - t_in) / float(max(search_steps, 1));
+#if defined(PRECISE_SEARCH)
+		vec2 atlas_px = vec2(textureSize(normal_atlas, 0));
+		float screen_lod = log2(max(max(length(gx * atlas_px), length(gy * atlas_px)), 1.0));
+#endif
+		float th[3] = float[3](0.0, 0.0, 0.0);
+		float hit[3] = float[3](0.0, 0.0, 0.0);
+		vec4 nh[3];
+		vec2 uh[3];
+		float t_ref = -1e9;
+		for (int i = 0; i < NUM_FRAMES; i++) {
+			nh[i] = vec4(0.0);
+			uh[i] = vec2(0.0);
+			if (wt[i] <= WEIGHT_MIN) {
+				continue;
+			}
+			float lo = t_in;
+			float hi = t_in;
+			bool front_only = false;
+#if defined(PRECISE_SEARCH)
+			for (int s = 0; s <= search_steps; s++) {
+				float t0 = t_in + dt * float(s - 1);
+				int fine = 1;
+				if (s > 0) {
+					vec2 u0 = frame_uv(ro + rd * t0, fx[i], fy[i]);
+					vec2 u1 = frame_uv(ro + rd * (t0 + dt), fx[i], fy[i]);
+					float reach = length((u1 - u0) * to_atlas * atlas_px);
+					float probe_lod = max(min(ceil(log2(max(reach, 1.0))), PROBE_MAX_LOD), screen_lod);
+					float cover = textureLod(normal_atlas, atlas_uv(fr[i], (u0 + u1) * 0.5), probe_lod).a;
+					fine = cover < PROBE_MIN ? 0 : (cover >= PROBE_SOLID ? 1 : SEARCH_SUB);
+				}
+				float sub = dt / float(max(fine, 1));
+				for (int k = 1; k <= fine; k++) {
+					float t = s == 0 ? t_in : t0 + sub * float(k);
+					vec3 p = ro + rd * t;
+					vec2 u = frame_uv(p, fx[i], fy[i]);
+					vec2 a = atlas_uv(fr[i], u);
+					vec4 n4 = textureGrad(normal_atlas, a, gx, gy);
+					float bk = use_back_layer ? textureGrad(back_atlas, a, gx, gy).r : 0.0;
+					bool crossed = s > 0 && crossed_slab(p, p - rd * sub, fd[i], u, n4, bk);
+					if (crossed || is_inside(p, fd[i], u, n4, bk, false)) {
+						front_only = crossed;
+						hit[i] = 1.0;
+						lo = s == 0 ? t : t - sub;
+						hi = t;
+						nh[i] = n4;
+						uh[i] = u;
+						break;
+					}
+				}
+				if (hit[i] > 0.5) {
+					break;
+				}
+			}
+#else
+			for (int s = 0; s <= search_steps; s++) {
+				float t = t_in + dt * float(s);
+				vec3 p = ro + rd * t;
+				vec2 u = frame_uv(p, fx[i], fy[i]);
+				vec2 a = atlas_uv(fr[i], u);
+				vec4 n4 = textureGrad(normal_atlas, a, gx, gy);
+				float bk = use_back_layer ? textureGrad(back_atlas, a, gx, gy).r : 0.0;
+				bool crossed = s > 0 && crossed_slab(p, p - rd * dt, fd[i], u, n4, bk);
+				if (crossed || is_inside(p, fd[i], u, n4, bk, false)) {
+					front_only = crossed;
+					hit[i] = 1.0;
+					hi = t;
+					nh[i] = n4;
+					uh[i] = u;
+					break;
+				}
 				lo = t;
 			}
+#endif
+			if (hit[i] < 0.5) {
+				continue;
+			}
+			for (int r = 0; r < refine_steps; r++) {
+				float t = (lo + hi) * 0.5;
+				vec3 p = ro + rd * t;
+				vec2 u = frame_uv(p, fx[i], fy[i]);
+				vec2 a = atlas_uv(fr[i], u);
+				vec4 n4 = textureGrad(normal_atlas, a, gx, gy);
+				float bk = use_back_layer ? textureGrad(back_atlas, a, gx, gy).r : 0.0;
+				if (is_inside(p, fd[i], u, n4, bk, front_only)) {
+					hi = t;
+					nh[i] = n4;
+					uh[i] = u;
+				} else {
+					lo = t;
+				}
+			}
+			th[i] = hi;
+			t_ref = max(t_ref, hi);
 		}
-		th[i] = hi;
-		t_ref = max(t_ref, hi);
-	}
-	float wsum = 0.0;
-	for (int i = 0; i < NUM_FRAMES; i++) {
-		if (wt[i] <= 0.0001) {
-			continue;
-		}
-		float w = wt[i];
-		if (hit[i] > 0.5 && layer_tolerance > 0.0) {
-			w *= 1.0 - smoothstep(layer_tolerance * 0.5, layer_tolerance, t_ref - th[i]);
-		}
-		wsum += w;
-		if (hit[i] < 0.5 || w <= 0.0001) {
-			continue;
-		}
-		float cov = nh[i].a * w;
-		acc_cov += cov;
-		acc_p += (ro + rd * th[i]) * cov;
-		if (!IN_SHADOW_PASS) {
+		float wsum = 0.0;
+		for (int i = 0; i < NUM_FRAMES; i++) {
+			if (wt[i] <= WEIGHT_MIN) {
+				continue;
+			}
+			float w = wt[i];
+			if (hit[i] > 0.5 && layer_tolerance > 0.0) {
+				w *= 1.0 - smoothstep(layer_tolerance * 0.5, layer_tolerance, t_ref - th[i]);
+			}
+			wsum += w;
+			if (hit[i] < 0.5 || w <= WEIGHT_MIN) {
+				continue;
+			}
+			float cov = nh[i].a * w;
+			acc_cov += cov;
+			acc_p += (ro + rd * th[i]) * cov;
 			acc_a += textureGrad(albedo_atlas, atlas_uv(fr[i], uh[i]), gx, gy) * w;
 			if (use_orm) {
 				acc_o += textureGrad(orm_atlas, atlas_uv(fr[i], uh[i]), gx, gy) * w;
@@ -360,26 +481,24 @@ void fragment() {
 			vec2 nxy = nh[i].xy / nh[i].a * 2.0 - 1.0;
 			acc_n += (fx[i] * nxy.x + fy[i] * nxy.y + fd[i] * sqrt(max(1.0 - dot(nxy, nxy), 0.0))) * cov;
 		}
-	}
-	if (acc_cov / max(wsum, 1e-4) < max(alpha_cut, 1e-4)) {
-		discard;
-	}
+		if (acc_cov / max(wsum, 1e-4) < max(alpha_cut, 1e-4)) {
+			WASTE_PIXEL
+		}
 #else
-	for (int i = 0; i < NUM_FRAMES; i++) {
-		if (wt[i] <= 0.0001) {
-			continue;
-		}
-		vec2 u = uv[i];
-		vec4 n4 = nd[i];
-		for (int s = 0; s < PARALLAX_STEPS; s++) {
-			u = frame_uv(ro + rd * ((baked_height(n4) - rod[i]) / denom[i]), fx[i], fy[i]);
-			n4 = textureGrad(normal_atlas, atlas_uv(fr[i], u), gx, gy);
-		}
-		float w = wt[i] * float(all(greaterThanEqual(u, vec2(0.0))) && all(lessThanEqual(u, vec2(1.0))));
-		float cov = n4.a * w;
-		acc_cov += cov;
-		acc_p += (ro + rd * ((baked_height(n4) - rod[i]) / denom[i])) * cov;
-		if (!IN_SHADOW_PASS) {
+		for (int i = 0; i < NUM_FRAMES; i++) {
+			if (wt[i] <= WEIGHT_MIN) {
+				continue;
+			}
+			vec2 u = uv[i];
+			vec4 n4 = nd[i];
+			for (int s = 0; s < PARALLAX_STEPS; s++) {
+				u = frame_uv(ro + rd * ((baked_height(n4) - rod[i]) / denom[i]), fx[i], fy[i]);
+				n4 = textureGrad(normal_atlas, atlas_uv(fr[i], u), gx, gy);
+			}
+			float w = wt[i] * float(all(greaterThanEqual(u, vec2(0.0))) && all(lessThanEqual(u, vec2(1.0))));
+			float cov = n4.a * w;
+			acc_cov += cov;
+			acc_p += (ro + rd * ((baked_height(n4) - rod[i]) / denom[i])) * cov;
 			acc_a += textureGrad(albedo_atlas, atlas_uv(fr[i], u), gx, gy) * w;
 			if (use_orm) {
 				acc_o += textureGrad(orm_atlas, atlas_uv(fr[i], u), gx, gy) * w;
@@ -390,55 +509,62 @@ void fragment() {
 			vec2 nxy = n4.a > 0.0 ? n4.xy / n4.a * 2.0 - 1.0 : vec2(0.0);
 			acc_n += (fx[i] * nxy.x + fy[i] * nxy.y + fd[i] * sqrt(max(1.0 - dot(nxy, nxy), 0.0))) * cov;
 		}
-	}
-	if (acc_cov < max(alpha_cut, 1e-4)) {
-		discard;
-	}
+		if (acc_cov < max(alpha_cut, 1e-4)) {
+			WASTE_PIXEL
+		}
 #endif
-	ALBEDO = acc_a.rgb / max(acc_a.a, 1e-4) * v_tint;
-	vec3 n_view = normalize(mat3(VIEW_MATRIX) * normalize(v_nmat * acc_n));
-	NORMAL = normalize(mix(NORMAL, n_view, normal_strength));
-	ROUGHNESS = v_surf.x;
-	METALLIC = v_surf.y;
-	SPECULAR = v_surf.z;
-	if (use_orm) {
-		vec3 orm = acc_o.rgb / max(acc_o.a, 1e-4);
-		AO = orm.r;
-		AO_LIGHT_AFFECT = v_mat.y;
-		ROUGHNESS = orm.g;
-		METALLIC = orm.b;
-	}
-	if (use_emission) {
-		EMISSION = acc_e.rgb / max(acc_e.a, 1e-4) * v_mat.x;
-	}
-	vec3 p_l = acc_p / acc_cov;
-	if (IN_SHADOW_PASS) {
-		p_l += rd * shadow_bias;
-	}
-	vec3 p_obj = v_bounds.xyz + p_l * v_bounds.w;
-	vec4 p_view = VIEW_MATRIX * (MODEL_MATRIX * vec4(p_obj, 1.0));
+		ALBEDO = acc_a.rgb / max(acc_a.a, 1e-4) * v_tint;
+		vec3 n_view = normalize(mat3(VIEW_MATRIX) * normalize(v_nmat * acc_n));
+		NORMAL = normalize(mix(NORMAL, n_view, normal_strength));
+		ROUGHNESS = v_surf.x;
+		METALLIC = v_surf.y;
+		SPECULAR = v_surf.z;
+		if (use_orm) {
+			vec3 orm = acc_o.rgb / max(acc_o.a, 1e-4);
+			AO = orm.r;
+			AO_LIGHT_AFFECT = v_mat.y;
+			ROUGHNESS = orm.g;
+			METALLIC = orm.b;
+		} else {
+			AO = v_mat.z;
+		}
+		if (use_emission) {
+			EMISSION = acc_e.rgb / max(acc_e.a, 1e-4) * v_mat.x;
+		}
+		vec3 p_l = acc_p / acc_cov;
+		vec3 p_obj = v_bounds.xyz + p_l * v_bounds.w;
+		vec4 p_view = VIEW_MATRIX * (MODEL_MATRIX * vec4(p_obj, 1.0));
 #ifndef NO_DEPTH_WRITE
-	vec4 clip = PROJECTION_MATRIX * p_view;
+		vec4 clip = PROJECTION_MATRIX * p_view;
 #if CURRENT_RENDERER == RENDERER_COMPATIBILITY
-	DEPTH = clip.z / clip.w * 0.5 + 0.5;
+		DEPTH = clip.z / clip.w * 0.5 + 0.5;
 #else
-	DEPTH = clip.z / clip.w;
+		DEPTH = clip.z / clip.w;
 #endif
 #endif
 #if DEBUG_MODE == 1
-	vec3 lod_color = QUALITY == 0 ? vec3(1.0, 0.2, 0.2) : (QUALITY == 1 ? vec3(1.0, 0.65, 0.1) : (QUALITY == 2 ? vec3(0.2, 1.0, 0.3) : vec3(0.2, 0.8, 1.0)));
-	ALBEDO = mix(ALBEDO, lod_color, 0.6);
+		vec3 lod_color = QUALITY == 0 ? vec3(1.0, 0.2, 0.2) : (QUALITY == 1 ? vec3(1.0, 0.65, 0.1) : (QUALITY == 2 ? vec3(0.2, 1.0, 0.3) : vec3(0.2, 0.8, 1.0)));
+		ALBEDO = mix(ALBEDO, lod_color, 0.6);
 #elif DEBUG_MODE == 2
-	float hue = fract(v_f01.x * 0.618034 + v_f01.y * 0.381966);
-	vec3 view_color = clamp(abs(fract(hue + vec3(0.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0) - 1.0, 0.0, 1.0);
-	ALBEDO = vec3(0.0);
-	EMISSION = view_color;
+		float hue = fract(v_f01.x * 0.618034 + v_f01.y * 0.381966);
+		vec3 view_color = clamp(abs(fract(hue + vec3(0.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0) - 1.0, 0.0, 1.0);
+		ALBEDO = vec3(0.0);
+		EMISSION = view_color;
 #elif DEBUG_MODE == 3
-	ALBEDO = vec3(0.0);
-	EMISSION = vec3(clamp(dot(p_l, -rd) * 0.5 + 0.5, 0.0, 1.0));
+		ALBEDO = vec3(0.0);
+		EMISSION = vec3(clamp(dot(p_l, -rd) * 0.5 + 0.5, 0.0, 1.0));
 #elif DEBUG_MODE == 4
-	ALBEDO = vec3(0.0);
-	EMISSION = use_orm ? acc_o.rgb / max(acc_o.a, 1e-4) : vec3(1.0, v_surf.x, v_surf.y);
+		ALBEDO = vec3(0.0);
+		EMISSION = use_orm ? acc_o.rgb / max(acc_o.a, 1e-4) : vec3(v_mat.z, v_surf.x, v_surf.y);
+#elif DEBUG_MODE == 5
+		ALBEDO = vec3(0.0);
+		SPECULAR = 0.0;
+		NORMAL = vec3(0.0, 0.0, 1.0);
+		EMISSION = wasted ? vec3(1.0, 0.0, 1.0) : vec3(0.35);
+		ALPHA = wasted ? 0.6 : 1.0;
 #endif
-	LIGHT_VERTEX = p_view.xyz;
+#if DEBUG_MODE != 5
+		LIGHT_VERTEX = p_view.xyz;
+#endif
+	}
 }

@@ -10,7 +10,11 @@ var _lod_mode: OptionButton
 var _fade: OptionButton
 var _fade_margin: SpinBox
 var _depth: CheckBox
+var _precise: CheckBox
+var _shadow_views: SpinBox
 var _debug: OptionButton
+var _group_info: Label
+var _group_buttons: Array[Button] = []
 var _batch: Array[Control] = []
 var _joins: Array[Button] = []
 
@@ -39,7 +43,19 @@ func _init(plugin: EditorPlugin) -> void:
 	_joins = [join, rebake]
 	actions.add_child(_button("Select Impostors", "Select the impostor cards of the selected objects.", _select_cards))
 	actions.add_child(_button("Select Sources", "Select the real objects of the selected cards.", _select_sources))
+	actions.add_child(_button("Re-bake All", "Bake every impostor of the open scene again with the settings saved in its atlas or group (undoable). Properties you changed on a card are kept.", _plugin.rebake_scene))
+	actions.add_child(_button("Select All", "Select every impostor card of the open scene.", _plugin.select_scene_cards))
 	add_child(actions)
+
+	add_child(HSeparator.new())
+	add_child(_heading("Group"))
+	_group_info = _label()
+	add_child(_group_info)
+	var group_row := HFlowContainer.new()
+	group_row.add_child(_button("Bake Group", "Bake the objects of the selected group with the group's own settings (undoable).", _plugin.bake_selected_groups.bind(false)))
+	group_row.add_child(_button("Re-bake Group", "Bake the selected group again with its settings; properties you changed on its cards are kept (undoable).", _plugin.bake_selected_groups.bind(true)))
+	_group_buttons.assign(group_row.get_children())
+	add_child(group_row)
 
 	add_child(HSeparator.new())
 	add_child(_heading("Selected impostors"))
@@ -87,10 +103,24 @@ func _init(plugin: EditorPlugin) -> void:
 	_depth.tooltip_text = "Off = flat card depth, cheaper on mobile. Applies to every card that shares the atlas."
 	grid.add_child(_depth)
 	grid.add_child(_button("Apply", "Set depth writing for the atlases of the selected cards (undoable).", _apply_depth))
+	grid.add_child(_label("Precise search"))
+	_precise = CheckBox.new()
+	_precise.text = "On"
+	_precise.tooltip_text = "Ultra only. Finds thin features (rings, wire, branches) much more reliably at the same step count. About 2-3x slower on the GPU, so use it for hero objects. Applies to every card that shares the atlas."
+	grid.add_child(_precise)
+	grid.add_child(_button("Apply", "Set the precise ray search for the atlases of the selected cards (undoable).", _apply_precise))
+	grid.add_child(_label("Shadow views"))
+	_shadow_views = SpinBox.new()
+	_shadow_views.min_value = 1
+	_shadow_views.max_value = 3
+	_shadow_views.tooltip_text = "Views blended in the shadow pass. 1 is fastest; 3 avoids shadow popping when the light moves. Applies to every card that shares the atlas."
+	_shadow_views.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	grid.add_child(_shadow_views)
+	grid.add_child(_button("Apply", "Set the shadow views for the atlases of the selected cards (undoable).", _apply_shadow_views))
 	add_child(grid)
 	var shared := _button("Edit Shared Look", "Open the material shared by every card of this atlas and quality.", _edit_shared)
 	add_child(shared)
-	_batch.append_array([_quality, _lod, _lod_mode, _fade, _fade_margin, _depth, shared])
+	_batch.append_array([_quality, _lod, _lod_mode, _fade, _fade_margin, _depth, _precise, _shadow_views, shared])
 	_batch.append_array(grid.get_children().filter(func(c: Node) -> bool: return c is Button))
 
 	add_child(HSeparator.new())
@@ -145,6 +175,8 @@ func _cards() -> Array[Node3D]:
 		var found: Array[Node3D] = []
 		if n.has_meta(OctaAtlas.CARD_META):
 			found.append(n)
+		elif n is OctaImpostorGroup:
+			found = n.cards()
 		elif n is Node3D:
 			found = OctaLOD.find_cards_below(n)
 		for c in found:
@@ -159,6 +191,11 @@ func refresh() -> void:
 	var cards := _cards()
 	var sel := EditorInterface.get_selection().get_top_selected_nodes().size()
 	_selection.text = "Nothing selected." if sel == 0 else "%d node(s) selected, %d impostor card(s) found." % [sel, cards.size()]
+	var groups: Array[OctaImpostorGroup] = _plugin._selected_groups()
+	for b in _group_buttons:
+		b.disabled = groups.is_empty()
+	_group_info.text = "No group selected. Add an OctaImpostorGroup node to bake objects with shared settings, then select it here." if groups.is_empty() else "
+".join(groups.map(func(g: OctaImpostorGroup) -> String: return g.info()))
 	for c in _batch:
 		c.set("disabled", cards.is_empty())
 	for b in _joins:
@@ -180,14 +217,26 @@ func refresh() -> void:
 	_fade.select(card.fade)
 	_fade_margin.value = card.fade_margin
 	_depth.button_pressed = card.atlas.write_depth
-	var a := card.atlas
+	_precise.button_pressed = card.atlas.precise_search
+	_shadow_views.value = card.atlas.shadow_views
+	_info.text = _atlas_text(card.atlas)
+
+
+func _atlas_text(a: OctaAtlas) -> String:
+	var maps := PackedStringArray(["albedo", "normal+depth"])
+	if a.orm:
+		maps.append("ORM")
+	elif a.format_version >= 4:
+		maps.append("ORM skipped (constant materials)")
+	if a.emission:
+		maps.append("emission")
+	if a.back_depth:
+		maps.append("back layer")
 	var w := a.albedo.get_width() if a.albedo else 0
 	var h := a.albedo.get_height() if a.albedo else 0
-	var layers := 2.0 + (0.25 if a.back_depth else 0.0) + (1.0 if a.orm else 0.0) + (1.0 if a.emission else 0.0)
-	var mb := float(w * h) * 4.0 * 4.0 / 3.0 * layers / 1048576.0
-	_info.text = "%s\n%d object(s), %dx%d atlas, %d px per view, %d views each\nAbout %.0f MB of video memory before compression%s%s%s" % [
-		a.resource_path.get_file() if not a.resource_path.is_empty() else "(not saved)", a.object_count(), w, h,
-		a.frame_resolution, a.grid_size * a.grid_size, mb, ", with back layer" if a.back_depth else "", ", material map" if a.orm else "", ", emission" if a.emission else ""]
+	return "%s\nFormat version %d, %d object(s), %dx%d atlas, %d px per view, %d views each\nMaps: %s\nHalf-res material maps: %s\nWrite depth: %s, shadow views: %d, precise search: %s\nAbout %.0f MB of video memory before compression" % [
+		a.resource_path.get_file() if not a.resource_path.is_empty() else "(not saved)", a.format_version, a.object_count(), w, h, a.frame_resolution, a.grid_size * a.grid_size,
+		", ".join(maps), "yes" if a.has_half_res_maps() else "no", "on" if a.write_depth else "off", a.shadow_views, "on" if a.precise_search else "off", a.vram_bytes() / 1048576.0]
 
 
 # --- Batch edits ---
@@ -237,6 +286,18 @@ func _apply_fade() -> void:
 
 
 func _apply_depth() -> void:
+	_set_atlases("write_depth", _depth.button_pressed, "Set Impostor Depth Writing")
+
+
+func _apply_precise() -> void:
+	_set_atlases("precise_search", _precise.button_pressed, "Set Impostor Precise Search")
+
+
+func _apply_shadow_views() -> void:
+	_set_atlases("shadow_views", int(_shadow_views.value), "Set Impostor Shadow Views")
+
+
+func _set_atlases(prop: String, value: Variant, action: String) -> void:
 	var atlases: Array[OctaAtlas] = []
 	for c in _cards():
 		if c is OctaImpostor and c.atlas != null and not atlases.has(c.atlas):
@@ -244,12 +305,12 @@ func _apply_depth() -> void:
 	if atlases.is_empty():
 		return
 	var ur: EditorUndoRedoManager = _plugin.get_undo_redo()
-	ur.create_action("Set Impostor Depth Writing", UndoRedo.MERGE_DISABLE, _cards()[0])
+	ur.create_action(action, UndoRedo.MERGE_DISABLE, _cards()[0])
 	for a in atlases:
-		ur.add_do_property(a, "write_depth", _depth.button_pressed)
+		ur.add_do_property(a, prop, value)
 		ur.add_do_method(self, "_save_atlas", a)
+		ur.add_undo_property(a, prop, a.get(prop))
 		ur.add_undo_method(self, "_save_atlas", a)
-		ur.add_undo_property(a, "write_depth", a.write_depth)
 	ur.commit_action()
 	refresh()
 

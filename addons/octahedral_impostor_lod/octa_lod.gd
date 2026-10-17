@@ -19,6 +19,7 @@ enum Fade {
 }
 
 const DEFAULT_FOV := 75.0
+const FOV_SETTING := "octa_lod/reference_fov"
 const SOURCE_META := &"octa_source"
 const MODE_META := &"octa_mode"
 
@@ -79,22 +80,22 @@ static func signature(node: Node3D) -> String:
 	return ";".join(parts)
 
 
-static func scene_candidates(root: Node, lod_distance: float) -> Array:
+static func scene_candidates(root: Node, lod_distance: float, use_groups := true) -> Array:
 	var out := []
-	_gather_candidates(root, lod_distance, out)
+	_gather_candidates(root, lod_distance, out, OctaImpostorGroup.claimed_nodes(root) if use_groups else {}, use_groups)
 	return out
 
 
-static func _gather_candidates(node: Node, lod: float, out: Array) -> void:
+static func _gather_candidates(node: Node, lod: float, out: Array, claimed: Dictionary, use_groups: bool) -> void:
 	for c: Node in node.get_children():
-		if c.has_meta(OctaAtlas.CARD_META) or (c is Node3D and not c.visible):
+		if c.has_meta(OctaAtlas.CARD_META) or (c is Node3D and not c.visible) or claimed.has(c):
 			continue
-		if not c is Node3D:
-			_gather_candidates(c, lod, out)
+		if not c is Node3D or (use_groups and c is OctaImpostorGroup):
+			_gather_candidates(c, lod, out, claimed, use_groups)
 			continue
 		var geo := geometry_below(c).filter(func(g: Node) -> bool: return g is MeshInstance3D and g.mesh != null)
 		if geo.is_empty():
-			_gather_candidates(c, lod, out)
+			_gather_candidates(c, lod, out, claimed, use_groups)
 			continue
 		var radius: float = OctaBaker._collect(c).bounds.w
 		var tris := 0
@@ -142,9 +143,46 @@ static func find_cards(source: Node) -> Array[Node3D]:
 	return out
 
 
+# --- Card overrides ---
+static func card_overrides(card: Node) -> Dictionary:
+	var out := {}
+	var base: OctaBakeSettings = card.atlas.bake_settings if card is OctaImpostor and card.atlas != null else null
+	if base == null:
+		return out
+	if card.quality != base.quality:
+		out.quality = card.quality
+	if card.lod_mode != base.lod_mode:
+		out.lod_mode = card.lod_mode
+	var replace: bool = card.get_meta(MODE_META, Mode.DYNAMIC_LOD) == Mode.REPLACE
+	if card.lod_mode == LodMode.DISTANCE and not replace and (card.lod_mode != base.lod_mode or not is_equal_approx(card.lod_distance, base.lod_distance)):
+		out.lod_distance = card.lod_distance
+	if not is_equal_approx(card.screen_percent, base.lod_screen_percent):
+		out.screen_percent = card.screen_percent
+	if card.fade != base.fade:
+		out.fade = card.fade
+	if not is_equal_approx(card.fade_margin, base.fade_margin):
+		out.fade_margin = card.fade_margin
+	if card.tint != Color.WHITE:
+		out.tint = card.tint
+	if not is_equal_approx(card.depth_multiplier, 1.0):
+		out.depth_multiplier = card.depth_multiplier
+	return out
+
+
+static func apply_overrides(card: OctaImpostor, overrides: Dictionary) -> void:
+	for p: String in ["lod_mode", "screen_percent", "fade", "fade_margin"]:
+		if overrides.has(p):
+			card.set(p, overrides[p])
+	if overrides.has("lod_distance") and card.lod_mode == LodMode.DISTANCE:
+		card.lod_distance = overrides.lod_distance
+	for p: String in ["quality", "tint", "depth_multiplier"]:
+		if overrides.has(p):
+			card.set(p, overrides[p])
+
+
 # --- Screen size and fade ---
 static func default_fov() -> float:
-	return float(ProjectSettings.get_setting("octa_lod/reference_fov", DEFAULT_FOV))
+	return float(ProjectSettings.get_setting(FOV_SETTING, DEFAULT_FOV))
 
 
 static func distance_for_screen_size(radius: float, percent: float, fov_deg := -1.0) -> float:

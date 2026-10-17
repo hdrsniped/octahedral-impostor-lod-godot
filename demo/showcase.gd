@@ -1,18 +1,52 @@
 extends Node3D
 
-const OctaAtlas = preload("res://addons/octahedral_impostor_lod/octa_atlas.gd")
-const OctaBaker = preload("res://addons/octahedral_impostor_lod/octa_baker.gd")
-const OctaBakeSettings = preload("res://addons/octahedral_impostor_lod/octa_bake_settings.gd")
-const DemoObjects = preload("res://demo/demo_objects.gd")
-
-const ASSET_NAMES: Array[String] = ["Procedural Rock", "Foliage Tree", "Gyroscope Rings"]
-const ASSET_TRIS: Array[int] = [32000, 4800, 6100]
-const QUALITY_NAMES: Array[String] = ["Low (1 View, Fastest)", "Medium (3-View Blend)", "High (Parallax Raymarching)"]
+const ASSET_NAMES: Array[String] = ["Procedural Rock", "Foliage Tree", "Gyroscope Rings", "Textured Ball"]
+const QUALITY_NAMES: Array[String] = ["Low (1 View, Fastest)", "Medium (3-View Blend)", "High (Parallax Raymarching)", "Ultra (Ray Search)"]
 const METRIC_NAMES: Array[String] = ["GPU", "FPS", "VRAM", "CPU", "Draws", "Tris", "All"]
-const VRAM_BUDGET_MB: float = 2048.0
+const BTN_STATES: Array[String] = ["normal", "hover", "pressed", "hover_pressed", "focus", "disabled"]
+const SNAP := {fps = 0, gpu_ms = 0.0, cpu_ms = 0.0, tris = 0, draws = 0, vram = 0.0, count = 0}
+const STATS_EMPTY := "Spawned Props: --\nFPS: --\nGPU Time: --\nCPU Time: --\nTriangles: --\nDraw Calls: --\nVRAM: --"
+const SUMMARY := "Press [F] to Hot-Swap to %s  •  [B] Auto-Benchmark  •  [G] Wave Metric"
+const HELP := """[F] HOT-SWAP  •  [O] AUTO LOD  •  [J] JOIN  •  [B] AUTO-BENCHMARK  •  [G] WAVE  •  [A] ANALYTICS  •  [H] TOGGLE UI  •  [L] LEVEL
+[b]Props (%d):[/b] [+] / [-] (one at a time)  •  [b]Asset:[/b] [1] Rock [2] Tree [3] Rings [4] Textured  •  [b]Quality:[/b] [F1] Low [F2] Med [F3] High [F4] Ultra
+[b]Plugin:[/b] [D] Debug View  •  [P] Precise Search  •  [W] Write Depth  •  [S] Shadows  •  [V] Shadow Views  •  [R] Sun Spin  •  [T] Tint
+[b]Camera:[/b] [Space] Orbit | Drag | Wheel  •  [Esc] Exit"""
+const HEX_REAL := "#ff4444"
+const HEX_IMP := "#33b5ff"
+const HEX_GOOD := "#44ff66"
+const PANEL_BG := Color(0, 0, 0, 0.55)
+const BTN_OFF := Color(0, 0, 0, 0.3)
+const BTN_ON := Color(1, 1, 1, 0.16)
+const WAVE_COLORS: Array[Color] = [Color(1.0, 0.28, 0.28), Color(0.22, 0.78, 1.0)]
+const WAVE_FILLS: Array[float] = [0.07, 0.10]
+const GRID_TEXT := Color(0.40, 0.48, 0.58)
+const VRAM_COLORS: Array[Color] = [Color(0.9, 0.9, 0.9, 0.9), Color(0.6, 0.6, 0.6, 0.9), Color(0.35, 0.35, 0.35, 0.9)]
+const ACCENTS: Array[Color] = [Color(0.2, 0.9, 0.45), Color(0.2, 0.75, 1.0)]
+const MB := 1048576.0
+const VRAM_BUDGET_MB := 2048.0
+const MAX_PROPS := 4000
+const WAVE_POINTS := 75
+const WAVE_STEP := 0.04
+const HUD_STEP := 0.125
+const SCAN_STEP := 1.0
+const TOAST_TIME := 2.0
+const SMOOTH := 0.15
+const SIDE_X := 2.2
+const LOD_DISTANCE := 14.0
+const LOD_FADE := 4.0
+const JOIN_CELL := 50.0
+const SUN_SPIN_DEG := 25.0
+const BENCH_STEP := 0.12
+const BENCH_GROW := 0.05
+const BENCH_STABLE := 5.0
+const BENCH_IMPOSTOR := 10.0
+const JOINED := &"demo_joined"
 
 var _atlas: OctaAtlas
-var _cached_models: Array[Node3D] = []
+var _models: Array[Node3D] = []
+var _tris: Array[int] = [0, 0, 0, 0]
+var _bake_ms: int = 0
+var _rid: RID
 
 var _current_level: int = 2
 var _current_asset: int = 0
@@ -22,77 +56,69 @@ var _is_impostor: bool = false
 var _tinted: bool = false
 var _auto_orbit: bool = true
 var _ui_visible: bool = true
+var _analytics_visible: bool = true
+var _joined: bool = false
+var _auto_lod: bool = false
+var _sun_spin: bool = false
+var _join_stats := Vector2i.ZERO
+var _join_base := Vector2(-1, -1)
 var _yaw: float = 0.0
 var _pitch: float = -0.28
 var _cam_dist: float = 6.0
 
 var _simulating_benchmark: bool = false
-var _target_fps_sim: float = 30.0
+var _target_fps: int = 30
 var _sim_timer: float = 0.0
 var _stabilize_timer: float = 0.0
 var _benchmark_stage: int = 0
-var _benchmark_done_timer: float = 0.0
-var _emergency_switch_msg: String = ""
 
 var _smooth_gpu_ms: float = 0.0
 var _smooth_cpu_ms: float = 0.0
+var _hud_timer: float = 0.0
+var _scan_timer: float = 0.0
+var _toast_timer: float = 0.0
+var _text_count: int = -1
+var _frame_times := PackedFloat32Array()
+var _frame_i: int = 0
+var _mem := Vector3.ZERO
+var _scan := {}
 
 var _current_metric: int = 0
 var _wave_red: Array[float] = []
 var _wave_blue: Array[float] = []
-var _wave_sample_timer: float = 0.0
-var _wave_canvas: Control
-var _wave_title_rt: RichTextLabel
-var _wave_val_label: Label
-var _metric_buttons: Array[Button] = []
-
-var _snap_real := {
-	"fps": 0,
-	"gpu_ms": 0.0,
-	"cpu_ms": 0.0,
-	"tris": 0,
-	"draws": 0,
-	"vram": 0.0,
-	"count": 0
-}
-
-var _snap_impostor := {
-	"fps": 0,
-	"gpu_ms": 0.0,
-	"cpu_ms": 0.0,
-	"tris": 0,
-	"draws": 0,
-	"vram": 0.0,
-	"count": 0
-}
+var _wave_timer: float = 0.0
+var _pts := PackedVector2Array()
+var _poly := PackedVector2Array()
+var _snap_real: Dictionary = SNAP.duplicate()
+var _snap_imp: Dictionary = SNAP.duplicate()
 
 var _cam_pivot: Node3D
 var _cam: Camera3D
-var _stage_root: Node3D
+var _sun: DirectionalLight3D
 var _level1_node: Node3D
 var _level2_node: Node3D
-var _left_slot: Node3D
-var _right_slot: Node3D
-var _left_label: Label3D
-var _right_label: Label3D
+var _field: Node3D
+var _join_node: Node3D
+var _sides: Array[Node] = []
+var _labels: Array[Label3D] = []
 
 var _hud: CanvasLayer
-var _real_stats_rt: RichTextLabel
-var _imp_stats_rt: RichTextLabel
-var _diff_stats_rt: RichTextLabel
+var _scan_hud: OctaDebugHUD
+var _btn_off: StyleBoxFlat
+var _btn_on: StyleBoxFlat
+var _stat_rts: Array[RichTextLabel] = []
 var _summary_label: Label
 var _help_rt: RichTextLabel
-
+var _toast_label: Label
+var _wave_canvas: Control
+var _wave_title_rt: RichTextLabel
+var _wave_val_rt: RichTextLabel
+var _metric_buttons: Array[Button] = []
 var _analytics_panel: PanelContainer
-var _analytics_visible: bool = true
-var _analytics_header_rt: RichTextLabel
-var _analytics_gpu_rt: RichTextLabel
-var _analytics_diag_rt: RichTextLabel
-var _analytics_lat_rt: RichTextLabel
-var _vram_bar_canvas: Control
-var _vram_info_rt: RichTextLabel
-var _frame_times: Array[float] = []
-
+var _info_rt: RichTextLabel
+var _state_rt: RichTextLabel
+var _vram_bar: Control
+var _info_head: String = ""
 var _loading_layer: CanvasLayer
 var _progress_bar: ProgressBar
 
@@ -100,43 +126,53 @@ var _progress_bar: ProgressBar
 func _ready() -> void:
 	DisplayServer.window_set_vsync_mode(DisplayServer.VSYNC_DISABLED)
 	Engine.max_fps = 0
-
-	var rid: RID = get_viewport().get_viewport_rid()
-	RenderingServer.viewport_set_measure_render_time(rid, true)
-
+	_rid = get_viewport().get_viewport_rid()
+	RenderingServer.viewport_set_measure_render_time(_rid, true)
+	_btn_off = _flat(BTN_OFF)
+	_btn_on = _flat(BTN_ON)
+	_frame_times.resize(WAVE_POINTS)
 	_setup_loading_screen()
 	_setup_environment()
 	_setup_stage()
 	_setup_camera()
 	_setup_hud()
-
-	_stage_root.visible = false
-	_hud.visible = false
-
 	_run_loading_and_bake()
+
+
+func _exit_tree() -> void:
+	OctaDebug.set_mode(OctaDebug.Mode.OFF)
+
+
+func _flat(bg: Color) -> StyleBoxFlat:
+	var sb := StyleBoxFlat.new()
+	sb.bg_color = bg
+	return sb
+
+
+func _mat(color: Color, roughness: float) -> StandardMaterial3D:
+	var m := StandardMaterial3D.new()
+	m.albedo_color = color
+	m.roughness = roughness
+	return m
 
 
 func _setup_loading_screen() -> void:
 	_loading_layer = CanvasLayer.new()
 	_loading_layer.layer = 120
-
 	var bg := ColorRect.new()
 	bg.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 	bg.color = Color(0.06, 0.07, 0.09)
 	_loading_layer.add_child(bg)
-
 	var center := CenterContainer.new()
 	center.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 	_loading_layer.add_child(center)
-
 	_progress_bar = ProgressBar.new()
 	_progress_bar.custom_minimum_size = Vector2(280, 4)
-	_progress_bar.min_value = 0.0
-	_progress_bar.max_value = 100.0
 	_progress_bar.value = 5.0
 	_progress_bar.show_percentage = false
+	_progress_bar.add_theme_stylebox_override("background", _flat(Color(1, 1, 1, 0.12)))
+	_progress_bar.add_theme_stylebox_override("fill", _flat(Color(0.8, 0.85, 0.9)))
 	center.add_child(_progress_bar)
-
 	add_child(_loading_layer)
 
 
@@ -150,410 +186,244 @@ func _setup_environment() -> void:
 	var we := WorldEnvironment.new()
 	we.environment = env
 	add_child(we)
-
-	var sun := DirectionalLight3D.new()
-	sun.position = Vector3(12, 18, 12)
-	sun.rotation_degrees = Vector3(-45, 40, 0)
-	sun.shadow_enabled = true
-	sun.light_energy = 1.35
-	sun.directional_shadow_max_distance = 80.0
-	add_child(sun)
-
+	_sun = DirectionalLight3D.new()
+	_sun.position = Vector3(12, 18, 12)
+	_sun.rotation_degrees = Vector3(-45, 40, 0)
+	_sun.shadow_enabled = true
+	_sun.light_energy = 1.35
+	_sun.directional_shadow_max_distance = 80.0
+	add_child(_sun)
 	var fill := DirectionalLight3D.new()
 	fill.rotation_degrees = Vector3(-20, -140, 0)
 	fill.light_energy = 0.45
-	fill.shadow_enabled = false
 	add_child(fill)
 
 
 func _setup_stage() -> void:
-	_stage_root = Node3D.new()
-	add_child(_stage_root)
-
-	var ground := MeshInstance3D.new()
-	var plane_mesh := PlaneMesh.new()
-	plane_mesh.size = Vector2(800, 800)
-	ground.mesh = plane_mesh
-	var gmat := StandardMaterial3D.new()
-	gmat.albedo_color = Color(0.11, 0.13, 0.16)
-	gmat.roughness = 0.7
-	ground.material_override = gmat
-	_stage_root.add_child(ground)
-
-	var grid := MeshInstance3D.new()
-	var grid_mesh := PlaneMesh.new()
-	grid_mesh.size = Vector2(600, 600)
-	grid.mesh = grid_mesh
-	grid.position.y = 0.002
-	var grid_mat := StandardMaterial3D.new()
-	grid_mat.albedo_color = Color(0.15, 0.18, 0.23)
-	grid_mat.roughness = 0.8
-	grid.material_override = grid_mat
-	_stage_root.add_child(grid)
-
+	var stage := Node3D.new()
+	add_child(stage)
+	for p: Array in [[800.0, 0.0, Color(0.11, 0.13, 0.16), 0.7], [600.0, 0.002, Color(0.15, 0.18, 0.23), 0.8]]:
+		var pm := PlaneMesh.new()
+		pm.size = Vector2(p[0], p[0])
+		_add_mesh(stage, pm, Vector3(0, p[1], 0), _mat(p[2], p[3]))
 	_level1_node = Node3D.new()
 	_level1_node.visible = false
-	_stage_root.add_child(_level1_node)
-
-	_left_slot = Node3D.new()
-	_left_slot.position = Vector3(-2.2, 0, 0)
-	_level1_node.add_child(_left_slot)
-
-	_right_slot = Node3D.new()
-	_right_slot.position = Vector3(2.2, 0, 0)
-	_level1_node.add_child(_right_slot)
-
-	_create_pedestal(_level1_node, Vector3(-2.2, 0, 0), Color(0.2, 0.9, 0.45))
-	_create_pedestal(_level1_node, Vector3(2.2, 0, 0), Color(0.2, 0.75, 1.0))
-
-	_left_label = Label3D.new()
-	_left_label.position = Vector3(-2.2, 3.2, 0)
-	_left_label.font_size = 28
-	_left_label.billboard = BaseMaterial3D.BILLBOARD_ENABLED
-	_level1_node.add_child(_left_label)
-
-	_right_label = Label3D.new()
-	_right_label.position = Vector3(2.2, 3.2, 0)
-	_right_label.font_size = 28
-	_right_label.billboard = BaseMaterial3D.BILLBOARD_ENABLED
-	_level1_node.add_child(_right_label)
-
+	stage.add_child(_level1_node)
+	for i in 2:
+		var pos := Vector3(SIDE_X * (2 * i - 1), 0, 0)
+		var slot := Node3D.new()
+		slot.position = pos
+		_level1_node.add_child(slot)
+		_sides.append(slot)
+		_create_pedestal(pos, ACCENTS[i])
+		var label := Label3D.new()
+		label.position = pos + Vector3(0, 3.2, 0)
+		label.font_size = 28
+		label.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+		_level1_node.add_child(label)
+		_labels.append(label)
 	_level2_node = Node3D.new()
-	_stage_root.add_child(_level2_node)
+	stage.add_child(_level2_node)
+	_field = Node3D.new()
+	_level2_node.add_child(_field)
+	_join_node = Node3D.new()
+	_level2_node.add_child(_join_node)
 
 
-func _create_pedestal(parent: Node3D, pos: Vector3, accent: Color) -> void:
-	var ped := Node3D.new()
-	ped.position = pos
+func _add_mesh(parent: Node3D, mesh: Mesh, pos: Vector3, mat: Material) -> void:
+	var mi := MeshInstance3D.new()
+	mi.mesh = mesh
+	mi.position = pos
+	mi.material_override = mat
+	parent.add_child(mi)
 
-	var cyl := MeshInstance3D.new()
+
+func _create_pedestal(pos: Vector3, accent: Color) -> void:
 	var cm := CylinderMesh.new()
 	cm.top_radius = 1.7
 	cm.bottom_radius = 1.75
 	cm.height = 0.08
 	cm.radial_segments = 64
-	cyl.mesh = cm
-	cyl.position.y = 0.04
-	var pmat := StandardMaterial3D.new()
-	pmat.albedo_color = Color(0.09, 0.11, 0.14)
-	pmat.roughness = 0.4
-	cyl.material_override = pmat
-	ped.add_child(cyl)
-
-	var ring := MeshInstance3D.new()
+	_add_mesh(_level1_node, cm, pos + Vector3(0, 0.04, 0), _mat(Color(0.09, 0.11, 0.14), 0.4))
 	var tm := TorusMesh.new()
 	tm.inner_radius = 1.68
 	tm.outer_radius = 1.74
 	tm.rings = 64
-	ring.mesh = tm
-	ring.position.y = 0.081
-	var rmat := StandardMaterial3D.new()
-	rmat.albedo_color = accent
+	var rmat := _mat(accent, 0.5)
 	rmat.emission_enabled = true
 	rmat.emission = accent * 0.9
-	ring.material_override = rmat
-	ped.add_child(ring)
-
-	parent.add_child(ped)
+	_add_mesh(_level1_node, tm, pos + Vector3(0, 0.081, 0), rmat)
 
 
 func _setup_camera() -> void:
 	_cam_pivot = Node3D.new()
 	_cam_pivot.position = Vector3(0, 1.0, 0)
 	add_child(_cam_pivot)
-
 	_cam = Camera3D.new()
-	_cam.position = Vector3(0, 0, _cam_dist)
 	_cam.current = true
 	_cam.far = 1200.0
 	_cam_pivot.add_child(_cam)
 	_update_camera()
 
 
+func _update_camera() -> void:
+	_cam_pivot.rotation = Vector3(_pitch, _yaw, 0)
+	_cam.position = Vector3(0, 0, _cam_dist)
+
+
+func _place_camera(pivot: Vector3, dist: float) -> void:
+	_cam_pivot.position = pivot
+	_cam_dist = dist
+	_update_camera()
+
+
+func _panel(anchor_x: Vector2, offset_x: Vector2, offset_y: Vector2, margin: Vector2i, anchor_y := 0.0) -> MarginContainer:
+	var panel := PanelContainer.new()
+	panel.add_theme_stylebox_override("panel", _flat(PANEL_BG))
+	panel.anchor_left = anchor_x.x
+	panel.anchor_right = anchor_x.y
+	panel.anchor_top = anchor_y
+	panel.anchor_bottom = anchor_y
+	panel.offset_left = offset_x.x
+	panel.offset_right = offset_x.y
+	panel.offset_top = offset_y.x
+	panel.offset_bottom = offset_y.y
+	var m := MarginContainer.new()
+	for side in ["left", "right"]:
+		m.add_theme_constant_override("margin_" + side, margin.x)
+	for side in ["top", "bottom"]:
+		m.add_theme_constant_override("margin_" + side, margin.y)
+	panel.add_child(m)
+	_hud.add_child(panel)
+	return m
+
+
+func _rich(min_size: Vector2, column := false) -> RichTextLabel:
+	var rt := RichTextLabel.new()
+	rt.bbcode_enabled = true
+	rt.scroll_active = false
+	rt.autowrap_mode = TextServer.AUTOWRAP_OFF
+	rt.custom_minimum_size = min_size
+	rt.fit_content = not column
+	rt.clip_contents = column
+	rt.size_flags_horizontal = 0 if column else Control.SIZE_EXPAND_FILL
+	return rt
+
+
+func _square_button(btn: Button, on: bool) -> void:
+	for state in BTN_STATES:
+		btn.add_theme_stylebox_override(state, _btn_on if on else _btn_off)
+
+
 func _setup_hud() -> void:
 	_hud = CanvasLayer.new()
 	_hud.layer = 10
+	add_child(_hud)
 
-	var panel_style := StyleBoxFlat.new()
-	panel_style.bg_color = Color(0, 0, 0, 0.55)
-	panel_style.set_corner_radius_all(0)
-
-	var wave_panel := PanelContainer.new()
-	wave_panel.add_theme_stylebox_override("panel", panel_style)
-	wave_panel.anchor_left = 0.0
-	wave_panel.anchor_right = 0.0
-	wave_panel.offset_left = 10
-	wave_panel.offset_right = 480
-	wave_panel.offset_top = 10
-	wave_panel.offset_bottom = 205
-
-	var wave_m := MarginContainer.new()
-	wave_m.add_theme_constant_override("margin_left", 10)
-	wave_m.add_theme_constant_override("margin_top", 8)
-	wave_m.add_theme_constant_override("margin_right", 10)
-	wave_m.add_theme_constant_override("margin_bottom", 8)
-
-	var wave_vbox := VBoxContainer.new()
-	wave_vbox.add_theme_constant_override("separation", 4)
-
-	var wave_header_hbox := HBoxContainer.new()
-	_wave_title_rt = RichTextLabel.new()
-	_wave_title_rt.bbcode_enabled = true
-	_wave_title_rt.fit_content = true
-	_wave_title_rt.scroll_active = false
-	_wave_title_rt.autowrap_mode = TextServer.AUTOWRAP_OFF
-	_wave_title_rt.custom_minimum_size = Vector2(280, 20)
-	_wave_title_rt.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	_wave_title_rt.text = "[b]WAVE MONITOR[/b]  •  [color=#ff4444]■ REAL[/color]  vs  [color=#33b5ff]■ IMPOSTOR[/color]"
-	wave_header_hbox.add_child(_wave_title_rt)
-
-	_wave_val_label = Label.new()
-	_wave_val_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
-	_wave_val_label.custom_minimum_size = Vector2(160, 20)
-	wave_header_hbox.add_child(_wave_val_label)
-	wave_vbox.add_child(wave_header_hbox)
-
-	var tabs_hbox := HBoxContainer.new()
-	tabs_hbox.add_theme_constant_override("separation", 3)
-	_metric_buttons.clear()
+	var wave := VBoxContainer.new()
+	_panel(Vector2(0, 0), Vector2(10, 480), Vector2(10, 205), Vector2i(10, 8)).add_child(wave)
+	var head := HBoxContainer.new()
+	_wave_title_rt = _rich(Vector2(280, 20))
+	_wave_val_rt = _rich(Vector2(160, 20))
+	_wave_val_rt.size_flags_horizontal = 0
+	head.add_child(_wave_title_rt)
+	head.add_child(_wave_val_rt)
+	wave.add_child(head)
+	var tabs := HBoxContainer.new()
+	tabs.add_theme_constant_override("separation", 3)
 	for i in METRIC_NAMES.size():
 		var btn := Button.new()
 		btn.text = METRIC_NAMES[i]
-		_square_button(btn, Color(0, 0, 0, 0.3))
 		btn.focus_mode = Control.FOCUS_NONE
 		btn.custom_minimum_size = Vector2(48, 18)
-		var b_idx: int = i
-		btn.pressed.connect(func(): _set_wave_metric(b_idx))
-		tabs_hbox.add_child(btn)
+		btn.pressed.connect(_set_wave_metric.bind(i))
+		tabs.add_child(btn)
 		_metric_buttons.append(btn)
-	wave_vbox.add_child(tabs_hbox)
-
+	wave.add_child(tabs)
 	_wave_canvas = Control.new()
 	_wave_canvas.custom_minimum_size = Vector2(450, 115)
 	_wave_canvas.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	_wave_canvas.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_wave_canvas.draw.connect(_draw_wave_canvas)
-	wave_vbox.add_child(_wave_canvas)
-
-	wave_m.add_child(wave_vbox)
-	wave_panel.add_child(wave_m)
-	_hud.add_child(wave_panel)
-
+	wave.add_child(_wave_canvas)
 	_set_wave_metric(0)
 
-	_analytics_panel = PanelContainer.new()
-	var analytics_style := StyleBoxFlat.new()
-	analytics_style.bg_color = Color(0, 0, 0, 0.55)
-	analytics_style.set_corner_radius_all(0)
-	_analytics_panel.add_theme_stylebox_override("panel", analytics_style)
-	_analytics_panel.anchor_left = 0.0
-	_analytics_panel.anchor_right = 0.0
-	_analytics_panel.offset_left = 10
-	_analytics_panel.offset_right = 480
-	_analytics_panel.offset_top = 215
-	_analytics_panel.offset_bottom = 215
-
-	var a_m := MarginContainer.new()
-	a_m.add_theme_constant_override("margin_left", 10)
-	a_m.add_theme_constant_override("margin_top", 8)
-	a_m.add_theme_constant_override("margin_right", 10)
-	a_m.add_theme_constant_override("margin_bottom", 8)
-
-	var a_vbox := VBoxContainer.new()
-	a_vbox.add_theme_constant_override("separation", 4)
-
-	_analytics_header_rt = RichTextLabel.new()
-	_analytics_header_rt.bbcode_enabled = true
-	_analytics_header_rt.fit_content = true
-	_analytics_header_rt.scroll_active = false
-	_analytics_header_rt.autowrap_mode = TextServer.AUTOWRAP_OFF
-	_analytics_header_rt.custom_minimum_size = Vector2(450, 20)
-	_analytics_header_rt.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	_analytics_header_rt.text = "[b]GRAPHIC ANALYTICS[/b]  •  VULKAN PIPELINE"
-	a_vbox.add_child(_analytics_header_rt)
-
-	_analytics_gpu_rt = RichTextLabel.new()
-	_analytics_gpu_rt.bbcode_enabled = true
-	_analytics_gpu_rt.fit_content = true
-	_analytics_gpu_rt.scroll_active = false
-	_analytics_gpu_rt.autowrap_mode = TextServer.AUTOWRAP_OFF
-	_analytics_gpu_rt.custom_minimum_size = Vector2(450, 20)
-	_analytics_gpu_rt.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	_analytics_gpu_rt.text = "GPU: Detecting GPU...  •  API: Vulkan 1.3"
-	a_vbox.add_child(_analytics_gpu_rt)
-
-	_analytics_diag_rt = RichTextLabel.new()
-	_analytics_diag_rt.bbcode_enabled = true
-	_analytics_diag_rt.fit_content = true
-	_analytics_diag_rt.scroll_active = false
-	_analytics_diag_rt.autowrap_mode = TextServer.AUTOWRAP_OFF
-	_analytics_diag_rt.custom_minimum_size = Vector2(450, 38)
-	_analytics_diag_rt.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	_analytics_diag_rt.text = "Mode: [color=#ff4444]REAL 3D MESH[/color]  •  Pipeline: INITIALIZING\nThroughput: 0.00 MTris/s  •  Draw Calls: 0"
-	a_vbox.add_child(_analytics_diag_rt)
-
-	_analytics_lat_rt = RichTextLabel.new()
-	_analytics_lat_rt.bbcode_enabled = true
-	_analytics_lat_rt.fit_content = true
-	_analytics_lat_rt.scroll_active = false
-	_analytics_lat_rt.autowrap_mode = TextServer.AUTOWRAP_OFF
-	_analytics_lat_rt.custom_minimum_size = Vector2(450, 20)
-	_analytics_lat_rt.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	_analytics_lat_rt.text = "Frame Time: 0.0 ms  •  99th% (p99): 0.0 ms  •  Jitter: 0.00 ms"
-	a_vbox.add_child(_analytics_lat_rt)
-
+	var info := VBoxContainer.new()
+	var a_margin := _panel(Vector2(0, 0), Vector2(10, 480), Vector2(215, 215), Vector2i(10, 8))
+	a_margin.add_child(info)
+	_analytics_panel = a_margin.get_parent()
+	_info_rt = _rich(Vector2(450, 136))
+	info.add_child(_info_rt)
 	var vram_header := Label.new()
 	vram_header.text = "VRAM ALLOCATION BREAKDOWN"
 	vram_header.add_theme_color_override("font_color", Color(0.8, 0.8, 0.8))
 	vram_header.add_theme_font_size_override("font_size", 10)
 	vram_header.custom_minimum_size = Vector2(450, 14)
-	a_vbox.add_child(vram_header)
+	info.add_child(vram_header)
+	_vram_bar = Control.new()
+	_vram_bar.custom_minimum_size = Vector2(450, 16)
+	_vram_bar.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_vram_bar.draw.connect(_draw_vram_bar)
+	info.add_child(_vram_bar)
+	_state_rt = _rich(Vector2(450, 136))
+	info.add_child(_state_rt)
 
-	_vram_bar_canvas = Control.new()
-	_vram_bar_canvas.custom_minimum_size = Vector2(450, 16)
-	_vram_bar_canvas.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	_vram_bar_canvas.draw.connect(_draw_vram_bar)
-	a_vbox.add_child(_vram_bar_canvas)
-
-	_vram_info_rt = RichTextLabel.new()
-	_vram_info_rt.bbcode_enabled = true
-	_vram_info_rt.fit_content = true
-	_vram_info_rt.scroll_active = false
-	_vram_info_rt.autowrap_mode = TextServer.AUTOWRAP_OFF
-	_vram_info_rt.custom_minimum_size = Vector2(450, 36)
-	_vram_info_rt.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	_vram_info_rt.text = "■ Tex: 0.0 MB  ■ Buf: 0.0 MB  ■ Other: 0.0 MB\nTotal: 0.0 MB / 2048 MB (0.0%)"
-	a_vbox.add_child(_vram_info_rt)
-
-	a_m.add_child(a_vbox)
-	_analytics_panel.add_child(a_m)
-	_hud.add_child(_analytics_panel)
-
-	var top_right_panel := PanelContainer.new()
-	top_right_panel.add_theme_stylebox_override("panel", panel_style)
-	top_right_panel.anchor_left = 1.0
-	top_right_panel.anchor_right = 1.0
-	top_right_panel.offset_left = -780
-	top_right_panel.offset_right = -10
-	top_right_panel.offset_top = 10
-	top_right_panel.offset_bottom = 262
-
-	var top_m := MarginContainer.new()
-	top_m.add_theme_constant_override("margin_left", 10)
-	top_m.add_theme_constant_override("margin_top", 8)
-	top_m.add_theme_constant_override("margin_right", 10)
-	top_m.add_theme_constant_override("margin_bottom", 8)
-
-	var stats_vbox := VBoxContainer.new()
-
-	var columns_hbox := HBoxContainer.new()
-	columns_hbox.size_flags_vertical = Control.SIZE_EXPAND_FILL
-
-	_real_stats_rt = RichTextLabel.new()
-	_real_stats_rt.bbcode_enabled = true
-	_real_stats_rt.fit_content = false
-	_real_stats_rt.scroll_active = false
-	_real_stats_rt.autowrap_mode = TextServer.AUTOWRAP_OFF
-	_real_stats_rt.custom_minimum_size = Vector2(240, 160)
-	_real_stats_rt.size_flags_horizontal = 0
-	_real_stats_rt.clip_contents = true
-	columns_hbox.add_child(_real_stats_rt)
-
-	var vsep1 := VSeparator.new()
-	vsep1.custom_minimum_size = Vector2(14, 0)
-	columns_hbox.add_child(vsep1)
-
-	_imp_stats_rt = RichTextLabel.new()
-	_imp_stats_rt.bbcode_enabled = true
-	_imp_stats_rt.fit_content = false
-	_imp_stats_rt.scroll_active = false
-	_imp_stats_rt.autowrap_mode = TextServer.AUTOWRAP_OFF
-	_imp_stats_rt.custom_minimum_size = Vector2(240, 160)
-	_imp_stats_rt.size_flags_horizontal = 0
-	_imp_stats_rt.clip_contents = true
-	columns_hbox.add_child(_imp_stats_rt)
-
-	var vsep2 := VSeparator.new()
-	vsep2.custom_minimum_size = Vector2(14, 0)
-	columns_hbox.add_child(vsep2)
-
-	_diff_stats_rt = RichTextLabel.new()
-	_diff_stats_rt.bbcode_enabled = true
-	_diff_stats_rt.fit_content = false
-	_diff_stats_rt.scroll_active = false
-	_diff_stats_rt.autowrap_mode = TextServer.AUTOWRAP_OFF
-	_diff_stats_rt.custom_minimum_size = Vector2(240, 160)
-	_diff_stats_rt.size_flags_horizontal = 0
-	_diff_stats_rt.clip_contents = true
-	columns_hbox.add_child(_diff_stats_rt)
-
-	stats_vbox.add_child(columns_hbox)
-
-	var hsep := HSeparator.new()
-	stats_vbox.add_child(hsep)
-
+	var stats := VBoxContainer.new()
+	_panel(Vector2(1, 1), Vector2(-780, -10), Vector2(10, 262), Vector2i(10, 8)).add_child(stats)
+	var cols := HBoxContainer.new()
+	cols.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	for i in 3:
+		if i > 0:
+			var sep := VSeparator.new()
+			sep.custom_minimum_size = Vector2(14, 0)
+			cols.add_child(sep)
+		var rt := _rich(Vector2(240, 160), true)
+		cols.add_child(rt)
+		_stat_rts.append(rt)
+	stats.add_child(cols)
+	stats.add_child(HSeparator.new())
 	_summary_label = Label.new()
 	_summary_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	stats_vbox.add_child(_summary_label)
+	stats.add_child(_summary_label)
 
-	top_m.add_child(stats_vbox)
-	top_right_panel.add_child(top_m)
-	_hud.add_child(top_right_panel)
-
-	var bot_panel := PanelContainer.new()
-	bot_panel.add_theme_stylebox_override("panel", panel_style)
-	bot_panel.anchor_left = 0.0
-	bot_panel.anchor_right = 1.0
-	bot_panel.anchor_top = 1.0
-	bot_panel.anchor_bottom = 1.0
-	bot_panel.offset_left = 10
-	bot_panel.offset_right = -10
-	bot_panel.offset_top = -120
-	bot_panel.offset_bottom = -10
-
-	var bm := MarginContainer.new()
-	bm.add_theme_constant_override("margin_left", 12)
-	bm.add_theme_constant_override("margin_top", 6)
-	bm.add_theme_constant_override("margin_right", 12)
-	bm.add_theme_constant_override("margin_bottom", 6)
-
-	_help_rt = RichTextLabel.new()
-	_help_rt.bbcode_enabled = true
-	_help_rt.fit_content = true
-	_help_rt.scroll_active = false
-	_help_rt.autowrap_mode = TextServer.AUTOWRAP_OFF
-	_help_rt.custom_minimum_size = Vector2(0, 56)
-	_help_rt.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_help_rt = _rich(Vector2(0, 56))
 	_help_rt.size_flags_vertical = Control.SIZE_SHRINK_CENTER
-	bm.add_child(_help_rt)
+	_panel(Vector2(0, 1), Vector2(10, -10), Vector2(-120, -10), Vector2i(12, 6), 1.0).add_child(_help_rt)
 
-	bot_panel.add_child(bm)
-	_hud.add_child(bot_panel)
+	_toast_label = Label.new()
+	_toast_label.add_theme_stylebox_override("normal", _flat(PANEL_BG))
+	_toast_label.set_anchors_and_offsets_preset(Control.PRESET_CENTER_BOTTOM)
+	_toast_label.offset_top = -130
+	_toast_label.offset_bottom = -130
+	_toast_label.grow_horizontal = Control.GROW_DIRECTION_BOTH
+	_toast_label.grow_vertical = Control.GROW_DIRECTION_BEGIN
+	_toast_label.visible = false
+	_hud.add_child(_toast_label)
 
-	add_child(_hud)
+	_scan_hud = OctaDebugHUD.new()
+	_scan_hud.visible = false
+	_scan_hud.process_mode = Node.PROCESS_MODE_DISABLED
+	_hud.add_child(_scan_hud)
+
+
+func _count_tris(root: Node) -> int:
+	var n := 0
+	for gi in OctaLOD.geometry_below(root):
+		if gi is MeshInstance3D and gi.mesh != null:
+			n += gi.mesh.get_faces().size() / 3
+	return n
 
 
 func _run_loading_and_bake() -> void:
 	await get_tree().process_frame
-
 	_progress_bar.value = 20.0
 	await get_tree().process_frame
-
-	_cached_models = [
-		DemoObjects.rock(1),
-		DemoObjects.tree(),
-		DemoObjects.rings()
-	]
-
+	_models = [DemoObjects.rock(1), DemoObjects.tree(), DemoObjects.rings(), DemoObjects.textured()]
+	for i in _models.size():
+		_tris[i] = _count_tris(_models[i])
 	_progress_bar.value = 45.0
 	await get_tree().process_frame
-
-	var sources: Array = [
-		_cached_models[0].duplicate(),
-		_cached_models[1].duplicate(),
-		_cached_models[2].duplicate()
-	]
-
+	var sources: Array = _models.map(func(m: Node3D) -> Node3D: return m.duplicate())
 	var settings := OctaBakeSettings.new()
 	settings.grid_size = 16
 	settings.hemisphere = true
@@ -561,544 +431,517 @@ func _run_loading_and_bake() -> void:
 	settings.msaa = Viewport.MSAA_4X
 	settings.padding_px = 2
 	settings.quality = OctaAtlas.Quality.HIGH
-
+	var t0 := Time.get_ticks_msec()
 	_atlas = await OctaBaker.bake(sources, self, settings)
+	if _atlas == null:
+		push_error("OctaBaker bake failed, retrying once")
+		await get_tree().process_frame
+		_atlas = await OctaBaker.bake(sources, self, settings)
+	_bake_ms = Time.get_ticks_msec() - t0
 	for s: Node in sources:
 		s.free()
-
 	if _atlas == null:
 		push_error("OctaBaker bake failed")
+		var failed := Label.new()
+		failed.text = "The impostor atlas could not be baked."
+		failed.add_theme_color_override("font_color", Color(1.0, 0.45, 0.4))
+		_progress_bar.get_parent().add_child(failed)
+		_progress_bar.hide()
 		return
-
 	_progress_bar.value = 85.0
 	await get_tree().process_frame
-
-	_switch_asset(0)
-
+	var adapter := RenderingServer.get_video_adapter_name()
+	_info_head = "[b]GRAPHIC ANALYTICS[/b]  •  %s RENDERER
+GPU: %s  •  API: %s
+Atlas: %d objects  •  %d x %d views  •  %d px  •  %.0f MB  •  baked in %.1f s" % [
+		RenderingServer.get_current_rendering_method().replace("_", " ").to_upper(), adapter if adapter != "" else "Hardware",
+		RenderingServer.get_video_adapter_api_version(), _atlas.object_count(), _atlas.grid_size, _atlas.grid_size,
+		_atlas.albedo.get_width(), _atlas.vram_bytes() / MB, _bake_ms / 1000.0]
 	_progress_bar.value = 100.0
-	await get_tree().process_frame
-
-	_stage_root.visible = true
-	_hud.visible = true
-	if _analytics_panel != null:
-		_analytics_panel.visible = true
-	_update_hud()
+	_rebuild()
 	await RenderingServer.frame_post_draw
-
-	if _loading_layer != null:
-		_loading_layer.queue_free()
-		_loading_layer = null
+	_loading_layer.queue_free()
+	_loading_layer = null
 
 
-func _reset_snapshots() -> void:
-	_snap_real.fps = 0
-	_snap_real.gpu_ms = 0.0
-	_snap_impostor.fps = 0
-	_snap_impostor.gpu_ms = 0.0
-
-
-func _switch_asset(idx: int) -> void:
-	_current_asset = idx
-	_reset_snapshots()
-	for c in _level2_node.get_children():
+func _clear(node: Node) -> void:
+	for c in node.get_children():
+		node.remove_child(c)
 		c.queue_free()
+
+
+func _slots() -> Array[Node]:
+	return _sides if _current_level == 1 else _field.get_children()
+
+
+func _count() -> int:
+	return _spawn_count if _current_level == 2 else 1
+
+
+func _live_imp() -> bool:
+	return _is_impostor and _current_level == 2
+
+
+func _rebuild() -> void:
+	_clear(_field)
+	_clear(_join_node)
+	for s in _sides:
+		_clear(s)
+	_snap_real.fps = 0
+	_snap_imp.fps = 0
 	if _current_level == 1:
 		_build_level_1()
 	else:
 		_build_level_2()
+	_apply_ui()
+
+
+func _fill_slot(slot: Node3D) -> void:
+	var real: Node3D = _models[_current_asset].duplicate()
+	real.name = "RealMesh"
+	slot.add_child(real)
+	var card := _atlas.create_card(_current_asset, _quality)
+	card.name = "ImpostorCard"
+	slot.add_child(card)
+	if _auto_lod:
+		_set_slot_lod(slot, true)
 
 
 func _build_level_1() -> void:
-	if _level1_node != null:
-		_level1_node.visible = true
-	if _level2_node != null:
-		_level2_node.visible = false
-	if _cam_pivot != null:
-		_cam_pivot.position = Vector3(0, 1.2, 0)
-	_cam_dist = 6.5
-	_update_camera()
-
-	if _left_slot != null:
-		for c in _left_slot.get_children():
-			c.queue_free()
-	if _right_slot != null:
-		for c in _right_slot.get_children():
-			c.queue_free()
-
-	if not _cached_models.is_empty() and _left_slot != null:
-		var real_mesh: Node3D = _cached_models[_current_asset].duplicate()
-		_left_slot.add_child(real_mesh)
-
-	if _atlas != null and _right_slot != null:
-		var card: MeshInstance3D = _atlas.create_card(_current_asset, _quality)
-		_right_slot.add_child(card)
-
-	if _left_label != null:
-		_left_label.text = "REAL 3D MESH\n[ %d Tris ]" % ASSET_TRIS[_current_asset]
-	if _right_label != null:
-		_right_label.text = "OCTAHEDRAL IMPOSTOR\n[ 2 Tris / 1 Quad ]"
-
-	if _tinted:
-		_apply_tint()
+	_level1_node.visible = true
+	_level2_node.visible = false
+	_place_camera(Vector3(0, 1.2, 0), 6.5)
+	for s in _sides:
+		_fill_slot(s)
+	_apply_view()
 
 
 func _build_level_2() -> void:
-	if _level1_node != null:
-		_level1_node.visible = false
-	if _level2_node != null:
-		_level2_node.visible = true
-	if _cam_pivot != null:
-		_cam_pivot.position = Vector3(0, 0.8, 0)
-	_cam_dist = clampf(5.0 + sqrt(float(_spawn_count)) * 1.25, 5.0, 140.0)
-	_update_camera()
+	_level1_node.visible = false
+	_level2_node.visible = true
+	_place_camera(Vector3(0, 0.8, 0), clampf(5.0 + sqrt(float(_spawn_count)) * 1.25, 5.0, 140.0))
+	var have: int = _field.get_child_count()
+	while have > _spawn_count:
+		have -= 1
+		var extra := _field.get_child(have)
+		_field.remove_child(extra)
+		extra.queue_free()
+	var rng := RandomNumberGenerator.new()
+	var golden_angle: float = PI * (3.0 - sqrt(5.0))
+	for i in range(have, _spawn_count):
+		rng.seed = 42 + i
+		var slot := Node3D.new()
+		if _spawn_count > 1 or i > 0:
+			var r: float = 2.4 * sqrt(float(i + 1))
+			slot.position = Vector3(cos(i * golden_angle) * r, 0, sin(i * golden_angle) * r)
+		slot.rotation.y = rng.randf() * TAU
+		slot.scale = Vector3.ONE * rng.randf_range(0.9, 1.2)
+		_field.add_child(slot)
+		_fill_slot(slot)
+		_style_slot(slot, not _is_impostor)
+	if _joined:
+		_rebuild_join()
 
-	if _level2_node == null:
+
+func _style_slot(slot: Node, real_on: bool) -> void:
+	var real: Node3D = slot.get_child(0)
+	var card: Node3D = slot.get_child(1)
+	real.visible = _auto_lod or real_on
+	card.visible = _auto_lod or not (real_on or card.get_meta(JOINED, false))
+
+
+func _apply_view() -> void:
+	_scan_timer = INF
+	if _current_level == 1:
+		for i in 2:
+			_style_slot(_sides[i], (i == 0) != _is_impostor)
+			_labels[i].text = _side_text(i)
+	else:
+		for s in _field.get_children():
+			_style_slot(s, not _is_impostor)
+		_join_node.visible = _is_impostor
+	_summary_label.text = SUMMARY % ("Real Mesh" if _is_impostor else "Impostor")
+
+
+func _side_text(i: int) -> String:
+	if _auto_lod:
+		return "AUTO LOD\nswaps at %d m" % LOD_DISTANCE
+	if (i == 0) != _is_impostor:
+		return "REAL 3D MESH\n[ %d Tris ]" % _tris[_current_asset]
+	return "OCTAHEDRAL IMPOSTOR\n[ 2 Tris / 1 Quad ]"
+
+
+func _apply_ui() -> void:
+	_hud.visible = _ui_visible
+	_analytics_panel.visible = _analytics_visible
+	for label in _labels:
+		label.visible = _ui_visible and _current_level == 1
+	_apply_view()
+
+
+func _set_slot_lod(slot: Node, on: bool) -> void:
+	var card: OctaImpostor = slot.get_child(1)
+	card.lod_distance = LOD_DISTANCE if on else 0.0
+	card.fade_margin = LOD_FADE
+	card.fade = OctaLOD.Fade.CROSSFADE if on and OctaLOD.fade_supported() else OctaLOD.Fade.NONE
+	for gi in OctaLOD.geometry_below(slot.get_child(0)):
+		gi.visibility_parent = gi.get_path_to(card) if on else NodePath()
+
+
+func _set_auto_lod(on: bool) -> void:
+	if on == _auto_lod:
 		return
-
-	var current_slots: Array[Node] = _level2_node.get_children()
-	var current_count: int = current_slots.size()
-
-	if current_count > _spawn_count:
-		for i in range(_spawn_count, current_count):
-			current_slots[i].queue_free()
-	elif current_count < _spawn_count:
-		var rng := RandomNumberGenerator.new()
-		var golden_angle: float = PI * (3.0 - sqrt(5.0))
-		var spacing: float = 2.4
-
-		for i in range(current_count, _spawn_count):
-			rng.seed = 42 + i
-			var pos: Vector3 = Vector3.ZERO
-			if _spawn_count > 1 or i > 0:
-				var r: float = spacing * sqrt(float(i + 1))
-				var theta: float = float(i) * golden_angle
-				pos = Vector3(cos(theta) * r, 0, sin(theta) * r)
-
-			var slot := Node3D.new()
-			slot.position = pos
-			slot.rotation.y = rng.randf() * TAU
-			var s: float = rng.randf_range(0.9, 1.2)
-			slot.scale = Vector3.ONE * s
-			_level2_node.add_child(slot)
-
-			var real_mesh: Node3D = _cached_models[_current_asset].duplicate()
-			real_mesh.name = "RealMesh"
-			real_mesh.visible = not _is_impostor
-			slot.add_child(real_mesh)
-
-			var card: MeshInstance3D = _atlas.create_card(_current_asset, _quality)
-			card.name = "ImpostorCard"
-			card.visible = _is_impostor
-			slot.add_child(card)
-
-	if _tinted:
-		_apply_tint()
+	if on:
+		_set_joined(false)
+	_auto_lod = on
+	for s in _slots():
+		_set_slot_lod(s, on)
+	_apply_view()
 
 
-func _set_impostor_mode(enabled: bool) -> void:
-	_is_impostor = enabled
-	for slot: Node in _level2_node.get_children():
-		if slot is Node3D:
-			var real_node := slot.get_node_or_null("RealMesh")
-			var card_node := slot.get_node_or_null("ImpostorCard")
-			if real_node is Node3D:
-				real_node.visible = not _is_impostor
-			if card_node is Node3D:
-				card_node.visible = _is_impostor
+func _set_impostor_mode(on: bool) -> void:
+	_set_auto_lod(false)
+	_is_impostor = on
+	_apply_view()
 
 
-func _toggle_impostor() -> void:
-	_set_impostor_mode(not _is_impostor)
+func _set_joined(on: bool) -> void:
+	if on == _joined:
+		return
+	if on:
+		_set_auto_lod(false)
+		_join_base = Vector2(_snap_imp.draws, _snap_imp.cpu_ms) if _snap_imp.fps > 0 else Vector2(-1, -1)
+		_is_impostor = true
+	_joined = on
+	_rebuild_join()
+
+
+func _rebuild_join() -> void:
+	_clear(_join_node)
+	var groups := {}
+	for s in _field.get_children():
+		s.get_child(1).set_meta(JOINED, false)
+		if _joined:
+			var cell := Vector3i((s.position / JOIN_CELL).floor())
+			if not groups.has(cell):
+				groups[cell] = []
+			groups[cell].append(s)
+	_join_stats = Vector2i.ZERO
+	var custom := OctaAtlas.joined_custom(Color.WHITE, 1.0)
+	for g: Array in groups.values():
+		if g.size() < 2:
+			continue
+		var xforms: Array = []
+		for s: Node3D in g:
+			xforms.append(s.transform)
+			s.get_child(1).set_meta(JOINED, true)
+		var customs: Array = []
+		customs.resize(g.size())
+		customs.fill(custom)
+		_join_node.add_child(_atlas.create_multimesh(_current_asset, xforms, _quality, customs))
+		_join_stats += Vector2i(1, g.size())
+	_apply_view()
+
+
+func _set_quality(q: int) -> void:
+	_quality = q
+	_snap_imp.fps = 0
+	for s in _slots():
+		s.get_child(1).quality = q
+	for mmi: GeometryInstance3D in _join_node.get_children():
+		mmi.material_override = _atlas.get_material(q)
+	_apply_tint()
+
+
+func _apply_tint() -> void:
+	var col := Color(1.0, 0.25, 0.25) if _tinted else Color.WHITE
+	for m in _atlas.materials:
+		if m != null:
+			m.set_shader_parameter("tint", col)
+
+
+func _change_props(step: int) -> void:
+	_spawn_count = clampi(_spawn_count + step, 1, MAX_PROPS)
+	_join_base = Vector2(-1, -1)
+	var other: Dictionary = _snap_real if _is_impostor else _snap_imp
+	other.fps = 0
+	_build_level_2()
+
+
+func _start_benchmark() -> void:
+	_simulating_benchmark = true
+	_set_joined(false)
+	_set_impostor_mode(false)
+	_spawn_count = 1
+	_sim_timer = 0.0
+	_stabilize_timer = 0.0
+	_benchmark_stage = 0
+	_snap_real.fps = 0
+	_snap_imp.fps = 0
+	_build_level_2()
+	_target_fps = 10 if Engine.get_frames_per_second() < 30 else 30
+
+
+func _unhandled_input(event: InputEvent) -> void:
+	if event is InputEventMouseMotion:
+		if Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT) or Input.is_mouse_button_pressed(MOUSE_BUTTON_RIGHT):
+			_yaw -= event.relative.x * 0.005
+			_pitch = clampf(_pitch - event.relative.y * 0.005, -0.9, 0.8)
+			_update_camera()
+	elif event is InputEventMouseButton and event.pressed:
+		if event.button_index == MOUSE_BUTTON_WHEEL_UP:
+			_cam_dist = clampf(_cam_dist - 2.0, 3.0, 180.0)
+		elif event.button_index == MOUSE_BUTTON_WHEEL_DOWN:
+			_cam_dist = clampf(_cam_dist + 2.0, 3.0, 180.0)
+		_update_camera()
+	elif event is InputEventKey and event.pressed and not event.echo:
+		_on_key(event.keycode)
+
+
+func _toast(text: String) -> void:
+	_toast_label.text = text
+	_toast_label.visible = true
+	_toast_timer = TOAST_TIME
+
+
+func _flag(title: String, on: bool, note := "") -> void:
+	_toast("%s: %s%s" % [title, "ON" if on else "OFF", note])
+
+
+func _on_key(k: Key) -> void:
+	if _atlas == null:
+		if k == KEY_ESCAPE:
+			get_tree().quit()
+		return
+	match k:
+		KEY_ESCAPE:
+			get_tree().quit()
+		KEY_G:
+			_set_wave_metric((_current_metric + 1) % METRIC_NAMES.size())
+		KEY_T:
+			_tinted = not _tinted
+			_apply_tint()
+			_flag("Tint", _tinted)
+		KEY_SPACE:
+			_auto_orbit = not _auto_orbit
+		KEY_A:
+			_analytics_visible = not _analytics_visible
+			_apply_ui()
+		KEY_H, KEY_TAB:
+			_ui_visible = not _ui_visible
+			_apply_ui()
+		_:
+			if not _simulating_benchmark:
+				_on_plugin_key(k)
+
+
+func _on_plugin_key(k: Key) -> void:
+	var field: bool = _current_level == 2
+	match k:
+		KEY_B:
+			if field:
+				_start_benchmark()
+		KEY_F, KEY_ENTER:
+			_set_impostor_mode(not _is_impostor)
+		KEY_L, KEY_M:
+			_current_level = 3 - _current_level
+			_rebuild()
+		KEY_EQUAL, KEY_KP_ADD, KEY_MINUS, KEY_KP_SUBTRACT:
+			if field:
+				_change_props(1 if k in [KEY_EQUAL, KEY_KP_ADD] else -1)
+		KEY_1, KEY_2, KEY_3, KEY_4:
+			_current_asset = k - KEY_1
+			_rebuild()
+			_toast("Asset: " + ASSET_NAMES[_current_asset])
+		KEY_F1, KEY_F2, KEY_F3, KEY_F4:
+			_set_quality(k - KEY_F1)
+			_toast("Quality: " + QUALITY_NAMES[_quality])
+		KEY_D:
+			OctaDebug.set_mode(((OctaDebug.mode + 1) % OctaDebug.Mode.size()) as OctaDebug.Mode)
+			if OctaDebug.mode != OctaDebug.Mode.OFF and field and not _is_impostor and not _auto_lod:
+				_set_impostor_mode(true)
+			_toast("Debug view: " + OctaDebug.mode_names()[OctaDebug.mode])
+		KEY_P:
+			_atlas.precise_search = not _atlas.precise_search
+			_flag("Precise search", _atlas.precise_search, " (Ultra only, about 2-3x GPU cost)")
+		KEY_W:
+			_atlas.write_depth = not _atlas.write_depth
+			_flag("Write depth", _atlas.write_depth)
+		KEY_S:
+			_sun.shadow_enabled = not _sun.shadow_enabled
+			_flag("Sun shadows", _sun.shadow_enabled)
+		KEY_V:
+			_atlas.shadow_views = _atlas.shadow_views % 3 + 1
+			_toast("Shadow views: %d" % _atlas.shadow_views)
+		KEY_R:
+			_sun_spin = not _sun_spin
+			_flag("Sun spin", _sun_spin)
+		KEY_O:
+			_set_auto_lod(not _auto_lod)
+			_flag("Auto LOD", _auto_lod, " (cards beyond %d m)" % LOD_DISTANCE)
+		KEY_J:
+			if field:
+				_set_joined(not _joined)
+				_flag("Join", _joined, " (%d groups, %d cards)" % [_join_stats.x, _join_stats.y])
+			else:
+				_toast("Join needs Level 2")
 
 
 func _set_wave_metric(idx: int) -> void:
 	_current_metric = idx
 	for i in _metric_buttons.size():
-		var btn: Button = _metric_buttons[i]
-		_square_button(btn, Color(1, 1, 1, 0.16) if i == _current_metric else Color(0, 0, 0, 0.3))
+		_square_button(_metric_buttons[i], i == idx)
 	_wave_red.clear()
 	_wave_blue.clear()
-	if _wave_canvas != null:
-		_wave_canvas.queue_redraw()
+	_wave_canvas.queue_redraw()
 
 
-func _square_button(btn: Button, bg: Color) -> void:
-	for state in ["normal", "hover", "pressed", "focus", "disabled"]:
-		var sb := StyleBoxFlat.new()
-		sb.bg_color = bg
-		sb.set_corner_radius_all(0)
-		sb.set_border_width_all(0)
-		btn.add_theme_stylebox_override(state, sb)
+func _draws() -> int:
+	return RenderingServer.get_rendering_info(RenderingServer.RENDERING_INFO_TOTAL_DRAW_CALLS_IN_FRAME)
 
 
-func _get_sample_value(for_impostor: bool, metric: int) -> float:
-	var count_mul: int = _spawn_count if _current_level == 2 else 1
-	var live_count: int = count_mul
+func _vram_mb() -> float:
+	return Performance.get_monitor(Performance.RENDER_VIDEO_MEM_USED) / MB
 
-	if for_impostor == _is_impostor:
+
+func _sample(imp: bool, metric: int) -> float:
+	var n: int = _count()
+	var tris: float = float((2 if imp else _tris[_current_asset]) * n)
+	var fps: float = float(Engine.get_frames_per_second())
+	if imp == _live_imp():
 		match metric:
 			0: return _smooth_gpu_ms
-			1: return float(Engine.get_frames_per_second())
-			2: return Performance.get_monitor(Performance.RENDER_VIDEO_MEM_USED) / 1048576.0
+			1: return fps
+			2: return _vram_mb()
 			3: return _smooth_cpu_ms
-			4: return float(RenderingServer.get_rendering_info(RenderingServer.RENDERING_INFO_TOTAL_DRAW_CALLS_IN_FRAME))
-			5:
-				var tris: int = (2 * live_count) if for_impostor else (ASSET_TRIS[_current_asset] * live_count)
-				return float(tris) / 1000.0
-			6:
-				var gpu_n: float = clampf(_smooth_gpu_ms / 33.3, 0.0, 1.0)
-				var cpu_n: float = clampf(_smooth_cpu_ms / 16.6, 0.0, 1.0)
-				var vram_n: float = clampf((Performance.get_monitor(Performance.RENDER_VIDEO_MEM_USED) / 1048576.0) / VRAM_BUDGET_MB, 0.0, 1.0)
-				var tris_n: float = clampf(float((2 * live_count) if for_impostor else (ASSET_TRIS[_current_asset] * live_count)) / 10000000.0, 0.0, 1.0)
-				return ((gpu_n * 0.45) + (cpu_n * 0.2) + (vram_n * 0.15) + (tris_n * 0.2)) * 100.0
-	else:
-		if for_impostor:
-			match metric:
-				0: return _snap_impostor.gpu_ms if _snap_impostor.fps > 0 else maxf(0.8 + float(live_count) * 0.001, 1.2)
-				1: return float(_snap_impostor.fps) if _snap_impostor.fps > 0 else clampf(float(Engine.get_frames_per_second()) * 3.5, 60.0, 300.0)
-				2: return _snap_impostor.vram if _snap_impostor.fps > 0 else (Performance.get_monitor(Performance.RENDER_VIDEO_MEM_USED) / 1048576.0) * 0.88
-				3: return _snap_impostor.cpu_ms if _snap_impostor.fps > 0 else maxf(_smooth_cpu_ms * 0.55, 1.0)
-				4: return float(_snap_impostor.draws) if _snap_impostor.fps > 0 else float(mini(12 + live_count / 100, 30))
-				5: return float(2 * live_count) / 1000.0
-				6: return 8.0 + float(live_count) * 0.002
-		else:
-			match metric:
-				0: return _snap_real.gpu_ms if _snap_real.fps > 0 else maxf(_smooth_gpu_ms * 6.0, 16.0)
-				1: return float(_snap_real.fps) if _snap_real.fps > 0 else clampf(float(Engine.get_frames_per_second()) * 0.25, 5.0, 60.0)
-				2: return _snap_real.vram if _snap_real.fps > 0 else (Performance.get_monitor(Performance.RENDER_VIDEO_MEM_USED) / 1048576.0) * 1.15
-				3: return _snap_real.cpu_ms if _snap_real.fps > 0 else _smooth_cpu_ms * 1.8
-				4: return float(_snap_real.draws) if _snap_real.fps > 0 else float(live_count + 5)
-				5: return float(ASSET_TRIS[_current_asset] * live_count) / 1000.0
-				6: return clampf(float(ASSET_TRIS[_current_asset] * live_count) / 80000.0 * 10.0 + 35.0, 30.0, 100.0)
-	return 0.0
-
-
-func _get_metric_max(metric: int) -> float:
+			4: return float(_draws())
+			5: return tris / 1000.0
+		var cost := clampf(_smooth_gpu_ms / 33.3, 0.0, 1.0) * 0.45 + clampf(_smooth_cpu_ms / 16.6, 0.0, 1.0) * 0.2
+		return (cost + clampf(_vram_mb() / VRAM_BUDGET_MB, 0.0, 1.0) * 0.15 + clampf(tris / 10000000.0, 0.0, 1.0) * 0.2) * 100.0
+	var s: Dictionary = _snap_imp if imp else _snap_real
+	var ok: bool = s.fps > 0
 	match metric:
-		0:
-			var peak_gpu: float = maxf(_snap_real.gpu_ms, _smooth_gpu_ms)
-			return maxf(peak_gpu * 1.3, 33.3)
-		1:
-			return maxf(float(Engine.get_frames_per_second()) * 1.3, 150.0)
-		2:
-			return VRAM_BUDGET_MB
-		3:
-			var peak_cpu: float = maxf(_snap_real.cpu_ms, _smooth_cpu_ms)
-			return maxf(peak_cpu * 1.3, 16.6)
-		4:
-			var peak_draws: float = maxf(float(_snap_real.draws), float(RenderingServer.get_rendering_info(RenderingServer.RENDERING_INFO_TOTAL_DRAW_CALLS_IN_FRAME)))
-			return maxf(peak_draws * 1.25, 200.0)
-		5:
-			var max_k: float = float(ASSET_TRIS[_current_asset] * (_spawn_count if _current_level == 2 else 1)) / 1000.0
-			return maxf(max_k * 1.25, 50.0)
-		6:
-			return 100.0
+		0: return s.gpu_ms if ok else (maxf(0.8 + n * 0.001, 1.2) if imp else maxf(_smooth_gpu_ms * 6.0, 16.0))
+		1: return float(s.fps) if ok else (clampf(fps * 3.5, 60.0, 300.0) if imp else clampf(fps * 0.25, 5.0, 60.0))
+		2: return s.vram if ok else _vram_mb() * (0.88 if imp else 1.15)
+		3: return s.cpu_ms if ok else (maxf(_smooth_cpu_ms * 0.55, 1.0) if imp else _smooth_cpu_ms * 1.8)
+		4: return float(s.draws) if ok else (float(mini(12 + n / 100, 30)) if imp else float(n + 5))
+		5: return tris / 1000.0
+	return 8.0 + n * 0.002 if imp else clampf(tris / 8000.0 + 35.0, 30.0, 100.0)
+
+
+func _metric_max(metric: int) -> float:
+	match metric:
+		0: return maxf(maxf(_snap_real.gpu_ms, _smooth_gpu_ms) * 1.3, 33.3)
+		1: return maxf(float(Engine.get_frames_per_second()) * 1.3, 150.0)
+		2: return VRAM_BUDGET_MB
+		3: return maxf(maxf(_snap_real.cpu_ms, _smooth_cpu_ms) * 1.3, 16.6)
+		4: return maxf(maxf(float(_snap_real.draws), float(_draws())) * 1.25, 200.0)
+		5: return maxf(float(_tris[_current_asset] * _count()) / 1000.0 * 1.25, 50.0)
 	return 100.0
 
 
-func _format_metric_val(metric: int, val: float) -> String:
+func _fmt(metric: int, v: float) -> String:
 	match metric:
-		0, 3: return "%.0fms" % val
-		1: return "%.0f" % val
-		2: return "%.0fM" % val
-		4: return "%.0f" % val
-		5: return "%.0fK" % val
-		6: return "%.0f%%" % val
-	return "%.0f" % val
+		0, 3: return "%.0fms" % v
+		2: return "%.0fM" % v
+		5: return "%.0fK" % v
+		6: return "%.0f%%" % v
+	return "%.0f" % v
 
 
 func _draw_wave_canvas() -> void:
-	if _wave_canvas == null:
-		return
-	var w: float = _wave_canvas.size.x
-	var h: float = _wave_canvas.size.y
+	var c := _wave_canvas
+	var w: float = c.size.x
+	var h: float = c.size.y
 	if w <= 20.0 or h <= 20.0:
 		return
-
-	_wave_canvas.draw_rect(Rect2(0, 0, w, h), Color(0, 0, 0, 0.5), true)
-	_wave_canvas.draw_rect(Rect2(0, 0, w, h), Color(0.18, 0.22, 0.28), false, 1.0)
-
-	var left_pad: float = 40.0
-	var right_pad: float = 8.0
-	var top_pad: float = 12.0
-	var bot_pad: float = 10.0
-	var plot_w: float = w - left_pad - right_pad
-	var plot_h: float = h - top_pad - bot_pad
-
-	var min_val: float = 0.0
-	var max_val: float = _get_metric_max(_current_metric)
-
+	c.draw_rect(Rect2(0, 0, w, h), Color(0, 0, 0, 0.5), true)
+	c.draw_rect(Rect2(0, 0, w, h), Color(0.18, 0.22, 0.28), false, 1.0)
+	var left := 40.0
+	var top := 12.0
+	var plot_w: float = w - left - 8.0
+	var plot_h: float = h - top - 10.0
+	var base: float = top + plot_h
+	var max_val: float = _metric_max(_current_metric)
+	var font := ThemeDB.fallback_font
 	for step in 3:
 		var frac: float = float(step + 1) / 3.0
-		var gy: float = top_pad + plot_h * (1.0 - frac)
-		_wave_canvas.draw_line(Vector2(left_pad, gy), Vector2(w - right_pad, gy), Color(0.12, 0.15, 0.20, 0.8), 1.0)
-		var val_mark: float = min_val + (max_val - min_val) * frac
-		var mark_str: String = _format_metric_val(_current_metric, val_mark)
-		_wave_canvas.draw_string(ThemeDB.fallback_font, Vector2(2, gy + 3), mark_str, HORIZONTAL_ALIGNMENT_LEFT, -1, 9, Color(0.40, 0.48, 0.58))
-
-	_wave_canvas.draw_line(Vector2(left_pad, top_pad + plot_h), Vector2(w - right_pad, top_pad + plot_h), Color(0.18, 0.22, 0.28), 1.0)
-	_wave_canvas.draw_string(ThemeDB.fallback_font, Vector2(2, top_pad + plot_h + 3), _format_metric_val(_current_metric, 0.0), HORIZONTAL_ALIGNMENT_LEFT, -1, 9, Color(0.40, 0.48, 0.58))
-
-	var count: int = _wave_red.size()
-	if count < 2:
+		var gy: float = top + plot_h * (1.0 - frac)
+		c.draw_line(Vector2(left, gy), Vector2(w - 8.0, gy), Color(0.12, 0.15, 0.20, 0.8), 1.0)
+		c.draw_string(font, Vector2(2, gy + 3), _fmt(_current_metric, max_val * frac), HORIZONTAL_ALIGNMENT_LEFT, -1, 9, GRID_TEXT)
+	c.draw_line(Vector2(left, base), Vector2(w - 8.0, base), Color(0.18, 0.22, 0.28), 1.0)
+	c.draw_string(font, Vector2(2, base + 3), _fmt(_current_metric, 0.0), HORIZONTAL_ALIGNMENT_LEFT, -1, 9, GRID_TEXT)
+	var n: int = _wave_red.size()
+	if n < 2:
 		return
-
-	var red_pts := PackedVector2Array()
-	var blue_pts := PackedVector2Array()
-	red_pts.resize(count)
-	blue_pts.resize(count)
-
-	var denom: float = maxf(max_val - min_val, 0.001)
-
-	for i in count:
-		var px: float = left_pad + (float(i) / float(count - 1)) * plot_w
-		var r_norm: float = clampf((_wave_red[i] - min_val) / denom, 0.0, 1.0)
-		var b_norm: float = clampf((_wave_blue[i] - min_val) / denom, 0.0, 1.0)
-		var ry: float = top_pad + plot_h * (1.0 - r_norm)
-		var by: float = top_pad + plot_h * (1.0 - b_norm)
-		red_pts[i] = Vector2(px, ry)
-		blue_pts[i] = Vector2(px, by)
-
-	var red_poly := PackedVector2Array()
-	red_poly.append(Vector2(left_pad, top_pad + plot_h))
-	for p in red_pts:
-		red_poly.append(p)
-	red_poly.append(Vector2(left_pad + plot_w, top_pad + plot_h))
-	_wave_canvas.draw_colored_polygon(red_poly, Color(1.0, 0.25, 0.25, 0.07))
-
-	var blue_poly := PackedVector2Array()
-	blue_poly.append(Vector2(left_pad, top_pad + plot_h))
-	for p in blue_pts:
-		blue_poly.append(p)
-	blue_poly.append(Vector2(left_pad + plot_w, top_pad + plot_h))
-	_wave_canvas.draw_colored_polygon(blue_poly, Color(0.2, 0.75, 1.0, 0.10))
-
-	_wave_canvas.draw_polyline(red_pts, Color(1.0, 0.28, 0.28), 2.0, true)
-	_wave_canvas.draw_polyline(blue_pts, Color(0.22, 0.78, 1.0), 2.0, true)
+	_pts.resize(n)
+	_poly.resize(n + 2)
+	_poly[0] = Vector2(left, base)
+	_poly[n + 1] = Vector2(left + plot_w, base)
+	var denom: float = maxf(max_val, 0.001)
+	for s in 2:
+		var data: Array[float] = _wave_blue if s == 1 else _wave_red
+		for i in n:
+			var p := Vector2(left + float(i) / float(n - 1) * plot_w, top + plot_h * (1.0 - clampf(data[i] / denom, 0.0, 1.0)))
+			_pts[i] = p
+			_poly[i + 1] = p
+		c.draw_colored_polygon(_poly, Color(WAVE_COLORS[s], WAVE_FILLS[s]))
+		c.draw_polyline(_pts, WAVE_COLORS[s], 2.0, true)
 
 
 func _draw_vram_bar() -> void:
-	if _vram_bar_canvas == null:
-		return
-	var w: float = _vram_bar_canvas.size.x
-	var h: float = _vram_bar_canvas.size.y
+	var w: float = _vram_bar.size.x
+	var h: float = _vram_bar.size.y
 	if w <= 10.0 or h <= 4.0:
 		return
-
-	_vram_bar_canvas.draw_rect(Rect2(0, 0, w, h), Color(0, 0, 0, 0.5), true)
-
-	var tex_mb: float = Performance.get_monitor(Performance.RENDER_TEXTURE_MEM_USED) / 1048576.0
-	var buf_mb: float = Performance.get_monitor(Performance.RENDER_BUFFER_MEM_USED) / 1048576.0
-	var tot_mb: float = Performance.get_monitor(Performance.RENDER_VIDEO_MEM_USED) / 1048576.0
-	var oth_mb: float = maxf(tot_mb - tex_mb - buf_mb, 0.0)
-
-	var tex_w: float = clampf((tex_mb / VRAM_BUDGET_MB) * w, 0.0, w)
-	var buf_w: float = clampf((buf_mb / VRAM_BUDGET_MB) * w, 0.0, maxf(w - tex_w, 0.0))
-	var oth_w: float = clampf((oth_mb / VRAM_BUDGET_MB) * w, 0.0, maxf(w - tex_w - buf_w, 0.0))
-
-	var cur_x: float = 0.0
-	if tex_w > 0.5:
-		_vram_bar_canvas.draw_rect(Rect2(cur_x, 0, tex_w, h), Color(0.9, 0.9, 0.9, 0.9), true)
-		cur_x += tex_w
-	if buf_w > 0.5:
-		_vram_bar_canvas.draw_rect(Rect2(cur_x, 0, buf_w, h), Color(0.6, 0.6, 0.6, 0.9), true)
-		cur_x += buf_w
-	if oth_w > 0.5:
-		_vram_bar_canvas.draw_rect(Rect2(cur_x, 0, oth_w, h), Color(0.35, 0.35, 0.35, 0.9), true)
-		cur_x += oth_w
-
+	_vram_bar.draw_rect(Rect2(0, 0, w, h), Color(0, 0, 0, 0.5), true)
+	var x := 0.0
+	for i in 3:
+		var pw: float = clampf(_mem[i] / VRAM_BUDGET_MB * w, 0.0, maxf(w - x, 0.0))
+		if pw > 0.5:
+			_vram_bar.draw_rect(Rect2(x, 0, pw, h), VRAM_COLORS[i], true)
+			x += pw
 	for i in range(1, 4):
-		var mx: float = (float(i) * 0.25) * w
-		_vram_bar_canvas.draw_line(Vector2(mx, 0), Vector2(mx, h), Color(0.3, 0.38, 0.48, 0.7), 1.0)
-
-
-func _update_hud() -> void:
-	var rid: RID = get_viewport().get_viewport_rid()
-	var raw_gpu: float = RenderingServer.viewport_get_measured_render_time_gpu(rid)
-	var raw_cpu: float = RenderingServer.viewport_get_measured_render_time_cpu(rid)
-	var fps: int = Engine.get_frames_per_second()
-	var draws: int = RenderingServer.get_rendering_info(RenderingServer.RENDERING_INFO_TOTAL_DRAW_CALLS_IN_FRAME)
-	var vram_mb: float = Performance.get_monitor(Performance.RENDER_VIDEO_MEM_USED) / 1048576.0
-
-	_smooth_gpu_ms = lerpf(_smooth_gpu_ms, raw_gpu, 0.15)
-	_smooth_cpu_ms = lerpf(_smooth_cpu_ms, raw_cpu, 0.15)
-
-	var count_mul: int = _spawn_count if _current_level == 2 else 1
-	var total_real_tris: int = ASSET_TRIS[_current_asset] * count_mul
-	var total_imp_tris: int = 2 * count_mul
-
-	if not _is_impostor:
-		_snap_real.fps = fps
-		_snap_real.gpu_ms = _smooth_gpu_ms
-		_snap_real.cpu_ms = _smooth_cpu_ms
-		_snap_real.tris = total_real_tris
-		_snap_real.draws = draws
-		_snap_real.vram = vram_mb
-		_snap_real.count = count_mul
-	else:
-		_snap_impostor.fps = fps
-		_snap_impostor.gpu_ms = _smooth_gpu_ms
-		_snap_impostor.cpu_ms = _smooth_cpu_ms
-		_snap_impostor.tris = total_imp_tris
-		_snap_impostor.draws = draws
-		_snap_impostor.vram = vram_mb
-		_snap_impostor.count = count_mul
-
-	_real_stats_rt.text = _stats_text("ORIGINAL (REAL MESH)", _snap_real)
-	_imp_stats_rt.text = _stats_text("OCTAHEDRAL IMPOSTOR", _snap_impostor)
-	_diff_stats_rt.text = _diff_text()
-
-	if _wave_title_rt != null:
-		_wave_title_rt.text = "[b]WAVE MONITOR[/b] (%s Props)  •  [color=#ff4444]■ REAL[/color]  vs  [color=#33b5ff]■ IMPOSTOR[/color]" % String.num_int64(count_mul)
-
-	if _wave_val_label != null:
-		var r_curr: float = _wave_red[-1] if not _wave_red.is_empty() else 0.0
-		var b_curr: float = _wave_blue[-1] if not _wave_blue.is_empty() else 0.0
-		_wave_val_label.text = "[color=#ff4444]R: %s[/color] | [color=#33b5ff]B: %s[/color]" % [
-			_format_metric_val(_current_metric, r_curr),
-			_format_metric_val(_current_metric, b_curr)
-		]
-
-	if _analytics_panel != null:
-		var adapter_name: String = RenderingServer.get_video_adapter_name()
-		if adapter_name.is_empty():
-			adapter_name = "Forward+ Hardware"
-		var api_ver: String = RenderingServer.get_video_adapter_api_version()
-		if api_ver.is_empty():
-			api_ver = "Vulkan 1.3"
-
-		_analytics_gpu_rt.text = "GPU: %s  •  API: %s" % [
-			adapter_name, api_ver
-		]
-
-		var cur_mode: String = "[color=#33b5ff]OCTA IMPOSTOR[/color]" if _is_impostor else "[color=#ff4444]REAL 3D MESH[/color]"
-		var diag_status: String
-		if _is_impostor:
-			diag_status = "OPTIMIZED (Fillrate/Geom Unconstrained)"
-		elif _smooth_gpu_ms >= 20.0 or _smooth_gpu_ms > _smooth_cpu_ms * 2.0:
-			diag_status = "GPU FILL / GEOMETRY BOUND"
-		elif draws >= 1200 or _smooth_cpu_ms > _smooth_gpu_ms * 1.5:
-			diag_status = "CPU DRAW-CALL BOUND"
-		else:
-			diag_status = "BALANCED PIPELINE"
-
-		var mtris_sec: float = (float(total_imp_tris if _is_impostor else total_real_tris) * float(fps)) / 1000000.0
-		_analytics_diag_rt.text = "Mode: %s  •  Pipeline: %s\nThroughput: %.2f MTris/s  •  Draws: %d" % [
-			cur_mode, diag_status, mtris_sec, draws
-		]
-
-		var p99_ms: float = 0.0
-		var jitter_ms: float = 0.0
-		if _frame_times.size() > 5:
-			var sorted_times: Array[float] = _frame_times.duplicate()
-			sorted_times.sort()
-			var p99_idx: int = clampi(int(float(sorted_times.size()) * 0.99), 0, sorted_times.size() - 1)
-			p99_ms = sorted_times[p99_idx]
-
-			var avg_ms: float = 0.0
-			for t in _frame_times:
-				avg_ms += t
-			avg_ms /= float(_frame_times.size())
-
-			var variance: float = 0.0
-			for t in _frame_times:
-				var d_val: float = t - avg_ms
-				variance += d_val * d_val
-			jitter_ms = sqrt(variance / float(_frame_times.size()))
-
-		var frame_ms: float = 1000.0 / float(maxi(fps, 1))
-		_analytics_lat_rt.text = "Frame Time: %.1f ms  •  99th%% (p99): %.1f ms  •  Jitter: %.2f ms" % [
-			frame_ms, p99_ms, jitter_ms
-		]
-
-		var tex_mb: float = Performance.get_monitor(Performance.RENDER_TEXTURE_MEM_USED) / 1048576.0
-		var buf_mb: float = Performance.get_monitor(Performance.RENDER_BUFFER_MEM_USED) / 1048576.0
-		var tot_mb: float = Performance.get_monitor(Performance.RENDER_VIDEO_MEM_USED) / 1048576.0
-		var oth_mb: float = maxf(tot_mb - tex_mb - buf_mb, 0.0)
-		var tot_pct: float = clampf((tot_mb / VRAM_BUDGET_MB) * 100.0, 0.0, 100.0)
-
-		_vram_info_rt.text = "■ Tex: %.1f MB  ■ Buf: %.1f MB  ■ Other: %.1f MB\nTotal: %.1f MB / %.0f MB (%.1f%%)" % [
-			tex_mb, buf_mb, oth_mb, tot_mb, VRAM_BUDGET_MB, tot_pct
-		]
-
-		if _vram_bar_canvas != null and _ui_visible and _analytics_visible:
-			_vram_bar_canvas.queue_redraw()
-
-	if _is_impostor:
-		_summary_label.text = "Press [F] to Hot-Swap to Real Mesh  •  [B] Auto-Benchmark  •  [G] Wave Metric"
-	else:
-		_summary_label.text = "Press [F] to Hot-Swap to Impostor  •  [B] Auto-Benchmark  •  [G] Wave Metric"
-
-	_help_rt.text = """[F] HOT-SWAP  •  [B] AUTO-BENCHMARK  •  [G] WAVE  •  [A] ANALYTICS  •  [H] TOGGLE UI  •  [L] LEVEL
-[b]Props (%s):[/b] [+] / [-] (one at a time)  •  [b]Asset:[/b] [1] Rock [2] Tree [3] Rings
-[b]Quality:[/b] [F1] Low [F2] Med [F3] High  •  [b]Camera:[/b] [Space] Orbit | Drag | Wheel  •  [T] Tint  •  [Esc] Exit""" % String.num_int64(_spawn_count if _current_level == 2 else 1)
+		_vram_bar.draw_line(Vector2(i * 0.25 * w, 0), Vector2(i * 0.25 * w, h), Color(0.3, 0.38, 0.48, 0.7), 1.0)
 
 
 func _process(delta: float) -> void:
 	if _auto_orbit:
 		_yaw += delta * 0.28
 		_update_camera()
-
-	_frame_times.append(delta * 1000.0)
-	if _frame_times.size() > 75:
-		_frame_times.pop_front()
-
-	if _benchmark_done_timer > 0.0:
-		_benchmark_done_timer -= delta
-
-	_wave_sample_timer += delta
-	if _wave_sample_timer >= 0.04:
-		_wave_sample_timer = 0.0
-		var r_sample: float = _get_sample_value(false, _current_metric)
-		var b_sample: float = _get_sample_value(true, _current_metric)
-		_wave_red.append(r_sample)
-		_wave_blue.append(b_sample)
-		if _wave_red.size() > 75:
+	if _atlas == null:
+		return
+	if _sun_spin:
+		_sun.rotation.y += deg_to_rad(SUN_SPIN_DEG) * delta
+	_frame_times[_frame_i % WAVE_POINTS] = delta * 1000.0
+	_frame_i += 1
+	_smooth_gpu_ms = lerpf(_smooth_gpu_ms, RenderingServer.viewport_get_measured_render_time_gpu(_rid), SMOOTH)
+	_smooth_cpu_ms = lerpf(_smooth_cpu_ms, RenderingServer.viewport_get_measured_render_time_cpu(_rid), SMOOTH)
+	_wave_timer += delta
+	if _wave_timer >= WAVE_STEP:
+		_wave_timer = 0.0
+		_wave_red.append(_sample(false, _current_metric))
+		_wave_blue.append(_sample(true, _current_metric))
+		if _wave_red.size() > WAVE_POINTS:
 			_wave_red.pop_front()
-		if _wave_blue.size() > 75:
 			_wave_blue.pop_front()
-		if _wave_canvas != null and _ui_visible:
+		if _ui_visible:
 			_wave_canvas.queue_redraw()
-
 	if _simulating_benchmark:
-		var rid: RID = get_viewport().get_viewport_rid()
-		var current_fps: int = Engine.get_frames_per_second()
-		var raw_gpu: float = RenderingServer.viewport_get_measured_render_time_gpu(rid)
-		var draws: int = RenderingServer.get_rendering_info(RenderingServer.RENDERING_INFO_TOTAL_DRAW_CALLS_IN_FRAME)
-		var vram_mb: float = Performance.get_monitor(Performance.RENDER_VIDEO_MEM_USED) / 1048576.0
-		var crash: String = _crash_reason(raw_gpu, delta, vram_mb, draws) if _benchmark_stage < 2 else ""
+		_step_benchmark(delta)
+	if _toast_timer > 0.0:
+		_toast_timer -= delta
+		_toast_label.visible = _toast_timer > 0.0
+	_hud_timer += delta
+	_scan_timer += delta
+	if _hud_timer >= HUD_STEP:
+		_hud_timer = 0.0
+		_update_hud()
 
-		if _benchmark_stage == 0:
-			if crash != "":
-				_start_impostor_stage()
-			else:
-				_sim_timer += delta
-				if _sim_timer >= 0.12:
-					_sim_timer = 0.0
-					if current_fps <= int(_target_fps_sim) or _spawn_count >= 5000:
-						_benchmark_stage = 1
-						_stabilize_timer = 0.0
-					else:
-						_spawn_count = mini(_spawn_count + maxi(int(_spawn_count * 0.05), 1), 5000)
-						_build_level_2()
-		elif _benchmark_stage == 1:
-			if crash != "":
-				_start_impostor_stage()
-			elif current_fps <= int(_target_fps_sim + 2.0) or _spawn_count >= 5000:
-				_stabilize_timer += delta
-				if _stabilize_timer >= 5.0:
-					_start_impostor_stage()
-			else:
-				_stabilize_timer = 0.0
-				_benchmark_stage = 0
-		else:
-			_stabilize_timer += delta
-			if _stabilize_timer >= 10.0:
-				_simulating_benchmark = false
-				_benchmark_stage = 0
-				_benchmark_done_timer = 0.0
 
-	_update_hud()
+func _crashed(raw_gpu: float, delta: float) -> bool:
+	return raw_gpu >= 50.0 or _smooth_gpu_ms >= 45.0 or delta >= 0.14 or _vram_mb() >= 1600.0 or _draws() >= 4000 or _tris[_current_asset] * _spawn_count >= 100000000
 
 
 func _start_impostor_stage() -> void:
@@ -1107,33 +950,157 @@ func _start_impostor_stage() -> void:
 	_set_impostor_mode(true)
 
 
-func _crash_reason(raw_gpu: float, delta: float, vram_mb: float, draws: int) -> String:
-	if raw_gpu >= 50.0 or _smooth_gpu_ms >= 45.0:
-		return "gpu"
-	if delta >= 0.14:
-		return "stall"
-	if vram_mb >= 1600.0:
-		return "vram"
-	if draws >= 4000:
-		return "draws"
-	if ASSET_TRIS[_current_asset] * _spawn_count >= 100000000:
-		return "tris"
-	return ""
+func _step_benchmark(delta: float) -> void:
+	var fps: int = Engine.get_frames_per_second()
+	var crashed: bool = _benchmark_stage < 2 and _crashed(RenderingServer.viewport_get_measured_render_time_gpu(_rid), delta)
+	if _benchmark_stage == 0:
+		if crashed:
+			_start_impostor_stage()
+			return
+		_sim_timer += delta
+		if _sim_timer >= BENCH_STEP:
+			_sim_timer = 0.0
+			if fps <= _target_fps or _spawn_count >= MAX_PROPS:
+				_benchmark_stage = 1
+				_stabilize_timer = 0.0
+			else:
+				_spawn_count = mini(_spawn_count + maxi(int(_spawn_count * BENCH_GROW), 1), MAX_PROPS)
+				_build_level_2()
+	elif _benchmark_stage == 1:
+		if crashed:
+			_start_impostor_stage()
+		elif fps <= _target_fps + 2 or _spawn_count >= MAX_PROPS:
+			_stabilize_timer += delta
+			if _stabilize_timer >= BENCH_STABLE:
+				_start_impostor_stage()
+		else:
+			_stabilize_timer = 0.0
+			_benchmark_stage = 0
+	else:
+		_stabilize_timer += delta
+		if _stabilize_timer >= BENCH_IMPOSTOR:
+			_simulating_benchmark = false
+			_benchmark_stage = 0
 
 
-func _stats_text(title: String, snap: Dictionary) -> String:
-	if snap.fps <= 0:
-		return "[b]%s[/b]\nSpawned Props: --\nFPS: --\nGPU Time: --\nCPU Time: --\nTriangles: --\nDraw Calls: --\nVRAM: --" % title
-	return "[b]%s[/b]\nSpawned Props: %s\nFPS: %d\nGPU Time: %.2f ms\nCPU Time: %.2f ms\nTriangles: %s\nDraw Calls: %d\nVRAM: %.1f MB (%.1f%%)" % [
-		title, String.num_int64(snap.count), snap.fps, snap.gpu_ms, snap.cpu_ms,
-		String.num_int64(snap.tris), snap.draws, snap.vram, clampf(snap.vram / VRAM_BUDGET_MB * 100.0, 0.0, 100.0)]
+func _live_tris() -> int:
+	if _auto_lod:
+		return _scan.get("real_visible", 0) * _tris[_current_asset] + _scan.get("impostor_visible", 0) * 2
+	return (2 if _live_imp() else _tris[_current_asset]) * _count()
+
+
+func _update_hud() -> void:
+	var fps: int = Engine.get_frames_per_second()
+	var count: int = _count()
+	var draws: int = _draws()
+	var imp: bool = _live_imp()
+	_mem = Vector3(Performance.get_monitor(Performance.RENDER_TEXTURE_MEM_USED), Performance.get_monitor(Performance.RENDER_BUFFER_MEM_USED), 0.0) / MB
+	var total: float = _vram_mb()
+	_mem.z = maxf(total - _mem.x - _mem.y, 0.0)
+	if not _auto_lod:
+		var snap: Dictionary = _snap_imp if imp else _snap_real
+		snap.merge({fps = fps, gpu_ms = _smooth_gpu_ms, cpu_ms = _smooth_cpu_ms, tris = (2 if imp else _tris[_current_asset]) * count,
+				draws = draws, vram = total, count = count}, true)
+	if not _hud.visible:
+		return
+	_stat_rts[0].text = _stats_text("ORIGINAL (REAL MESH)", _snap_real)
+	_stat_rts[1].text = _stats_text("OCTAHEDRAL IMPOSTOR", _snap_imp)
+	_stat_rts[2].text = _diff_text()
+	if count != _text_count:
+		_text_count = count
+		_wave_title_rt.text = "[b]WAVE MONITOR[/b] (%d Props)  •  [color=%s]■ REAL[/color]  vs  [color=%s]■ IMPOSTOR[/color]" % [count, HEX_REAL, HEX_IMP]
+		_help_rt.text = HELP % count
+	_wave_val_rt.text = "[right][color=%s]R: %s[/color] | [color=%s]B: %s[/color][/right]" % [
+		HEX_REAL, _fmt(_current_metric, _wave_red.back() if not _wave_red.is_empty() else 0.0),
+		HEX_IMP, _fmt(_current_metric, _wave_blue.back() if not _wave_blue.is_empty() else 0.0)]
+	if not _analytics_visible:
+		return
+	if _scan_timer >= SCAN_STEP * maxf(1.0, count / 400.0) and not _simulating_benchmark:
+		_scan_timer = 0.0
+		_scan = _scan_hud.scan()
+	_update_analytics(fps, draws, imp)
+
+
+func _update_analytics(fps: int, draws: int, imp: bool) -> void:
+	var mode := "SIDE-BY-SIDE"
+	if _auto_lod:
+		mode = "[color=#ffd24a]AUTO LOD[/color]"
+	elif _current_level == 2:
+		mode = "[color=%s]%s[/color]" % [HEX_IMP, "OCTA IMPOSTOR"] if imp else "[color=%s]REAL 3D MESH[/color]" % HEX_REAL
+	var status := "BALANCED PIPELINE"
+	if imp:
+		status = "OPTIMIZED (Fillrate/Geom Unconstrained)"
+	elif _smooth_gpu_ms >= 20.0 or _smooth_gpu_ms > _smooth_cpu_ms * 2.0:
+		status = "GPU FILL / GEOMETRY BOUND"
+	elif draws >= 1200 or _smooth_cpu_ms > _smooth_gpu_ms * 1.5:
+		status = "CPU DRAW-CALL BOUND"
+	var n: int = mini(_frame_i, WAVE_POINTS)
+	var p99 := 0.0
+	var jitter := 0.0
+	if n > 5:
+		var ft := _frame_times.slice(0, n)
+		ft.sort()
+		p99 = ft[clampi(int(n * 0.99), 0, n - 1)]
+		var sum := 0.0
+		var squares := 0.0
+		for t in ft:
+			sum += t
+			squares += t * t
+		jitter = sqrt(maxf(squares / n - pow(sum / n, 2.0), 0.0))
+	_info_rt.text = "%s
+Mode: %s  •  Pipeline: %s
+Throughput: %.2f MTris/s  •  Draws: %d
+Frame Time: %.1f ms  •  99th%% (p99): %.1f ms  •  Jitter: %.2f ms" % [
+		_info_head, mode, status, float(_live_tris()) * fps / 1000000.0, draws, 1000.0 / maxi(fps, 1), p99, jitter]
+	_vram_bar.queue_redraw()
+	_state_rt.text = _state_text(draws)
+
+
+func _state_text(draws: int) -> String:
+	var precise := "OFF"
+	if _atlas.precise_search:
+		precise = "ON (Ultra, 2-3x)" if _quality == OctaAtlas.Quality.ULTRA else "ON (needs Ultra)"
+	var lod := "HOT-SWAP"
+	if _auto_lod:
+		lod = "AUTO %d m (%s)" % [LOD_DISTANCE, "crossfade %d m" % LOD_FADE if OctaLOD.fade_supported() else "pop"]
+	var join := "n/a (Level 2)"
+	if _current_level == 2:
+		join = "OFF"
+	if _joined and _current_level == 2:
+		join = "%d groups / %d cards" % [_join_stats.x, _join_stats.y]
+		if _join_base.x >= 0.0:
+			join += ", draws %d (was %d), CPU %.1f (was %.1f) ms" % [draws, _join_base.x, _smooth_cpu_ms, _join_base.y]
+	var fill: float = _scan.get("card_fill", {}).get(_atlas, -1.0)
+	var real: int = _scan.get("real_visible", 0) - (_join_stats.y if _joined and _is_impostor else 0)
+	var total := _vram_mb()
+	return "■ Tex: %.1f MB  ■ Buf: %.1f MB  ■ Other: %.1f MB
+Total: %.1f MB / %.0f MB (%.1f%%)
+Quality: %s  •  Debug: %s  •  Write depth: %s
+Precise: %s  •  Shadows: %s (%d view)  •  Sun spin: %s
+LOD: %s  •  Join: %s
+Cards: %d drawn / %d real  •  Card fill: %s" % [
+		_mem.x, _mem.y, _mem.z, total, VRAM_BUDGET_MB, clampf(total / VRAM_BUDGET_MB * 100.0, 0.0, 100.0),
+		OctaAtlas.Quality.keys()[_quality], OctaDebug.mode_names()[OctaDebug.mode], _onoff(_atlas.write_depth),
+		precise, _onoff(_sun.shadow_enabled), _atlas.shadow_views, _onoff(_sun_spin), lod, join,
+		_scan.get("impostor_visible", 0), real, "%.0f%%" % fill if fill >= 0.0 else "--"]
+
+
+func _onoff(on: bool) -> String:
+	return "ON" if on else "OFF"
+
+
+func _stats_text(title: String, s: Dictionary) -> String:
+	if s.fps <= 0:
+		return "[b]%s[/b]\n%s" % [title, STATS_EMPTY]
+	return "[b]%s[/b]\nSpawned Props: %d\nFPS: %d\nGPU Time: %.2f ms\nCPU Time: %.2f ms\nTriangles: %d\nDraw Calls: %d\nVRAM: %.1f MB (%.1f%%)" % [
+		title, s.count, s.fps, s.gpu_ms, s.cpu_ms, s.tris, s.draws, s.vram, clampf(s.vram / VRAM_BUDGET_MB * 100.0, 0.0, 100.0)]
 
 
 func _diff_text() -> String:
 	var r: Dictionary = _snap_real
-	var i: Dictionary = _snap_impostor
+	var i: Dictionary = _snap_imp
 	if r.fps <= 0 or i.fps <= 0:
-		return "[b]DIFFERENCE (%)[/b]\nSpawned Props: --\nFPS: --\nGPU Time: --\nCPU Time: --\nTriangles: --\nDraw Calls: --\nVRAM: --"
+		return "[b]DIFFERENCE (%)[/b]\n" + STATS_EMPTY
 	return "[b]DIFFERENCE (%%)[/b]\nSpawned Props: %s\nFPS: %s\nGPU Time: %s\nCPU Time: %s\nTriangles: %s\nDraw Calls: %s\nVRAM: %s" % [
 		_pct(i.count, r.count, true), _pct(i.fps, r.fps, true), _pct(i.gpu_ms, r.gpu_ms, false), _pct(i.cpu_ms, r.cpu_ms, false),
 		_pct(i.tris, r.tris, false), _pct(i.draws, r.draws, false), _pct(i.vram, r.vram, false)]
@@ -1144,129 +1111,4 @@ func _pct(a: float, b: float, higher_better: bool) -> String:
 	var txt: String = "%+.1f%%" % d
 	if absf(d) < 0.05:
 		return txt
-	var good: bool = (d > 0.0) == higher_better
-	return "[color=%s]%s[/color]" % ["#44ff66" if good else "#ff4444", txt]
-	_update_hud()
-
-
-func _update_camera() -> void:
-	_cam_pivot.rotation = Vector3(_pitch, _yaw, 0)
-	_cam.position = Vector3(0, 0, _cam_dist)
-
-
-func _unhandled_input(event: InputEvent) -> void:
-	if event is InputEventMouseMotion:
-		if Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT) or Input.is_mouse_button_pressed(MOUSE_BUTTON_RIGHT):
-			_yaw -= event.relative.x * 0.005
-			_pitch = clampf(_pitch - event.relative.y * 0.005, -0.9, 0.8)
-			_update_camera()
-
-	elif event is InputEventMouseButton and event.pressed:
-		if event.button_index == MOUSE_BUTTON_WHEEL_UP:
-			_cam_dist = clampf(_cam_dist - 2.0, 3.0, 180.0)
-			_update_camera()
-		elif event.button_index == MOUSE_BUTTON_WHEEL_DOWN:
-			_cam_dist = clampf(_cam_dist + 2.0, 3.0, 180.0)
-			_update_camera()
-
-	elif event is InputEventKey and event.pressed and not event.echo:
-		match event.keycode:
-			KEY_F, KEY_ENTER:
-				if _current_level == 2 and not _simulating_benchmark:
-					_toggle_impostor()
-			KEY_B:
-				if _current_level == 2 and not _simulating_benchmark:
-					_simulating_benchmark = true
-					_set_impostor_mode(false)
-					_spawn_count = 1
-					_sim_timer = 0.0
-					_stabilize_timer = 0.0
-					_benchmark_stage = 0
-					_benchmark_done_timer = 0.0
-					_emergency_switch_msg = ""
-					_reset_snapshots()
-					_build_level_2()
-
-					var start_fps: int = Engine.get_frames_per_second()
-					if start_fps < 30:
-						_target_fps_sim = 10.0
-					else:
-						_target_fps_sim = 30.0
-			KEY_G:
-				_set_wave_metric((_current_metric + 1) % METRIC_NAMES.size())
-			KEY_M, KEY_L:
-				if not _simulating_benchmark:
-					_current_level = 1 if _current_level == 2 else 2
-					_switch_asset(_current_asset)
-			KEY_1:
-				if not _simulating_benchmark:
-					_switch_asset(0)
-			KEY_2:
-				if not _simulating_benchmark:
-					_switch_asset(1)
-			KEY_3:
-				if not _simulating_benchmark:
-					_switch_asset(2)
-			KEY_F1:
-				if not _simulating_benchmark:
-					_quality = OctaAtlas.Quality.LOW
-					_apply_quality()
-			KEY_F2:
-				if not _simulating_benchmark:
-					_quality = OctaAtlas.Quality.MEDIUM
-					_apply_quality()
-			KEY_F3:
-				if not _simulating_benchmark:
-					_quality = OctaAtlas.Quality.HIGH
-					_apply_quality()
-			KEY_EQUAL, KEY_KP_ADD:
-				if _current_level == 2 and not _simulating_benchmark:
-					var step: int = 1
-					_spawn_count = mini(_spawn_count + step, 5000)
-					if _is_impostor:
-						_snap_real.fps = 0
-					else:
-						_snap_impostor.fps = 0
-					_build_level_2()
-			KEY_MINUS, KEY_KP_SUBTRACT:
-				if _current_level == 2 and not _simulating_benchmark:
-					var step: int = 1
-					_spawn_count = maxi(_spawn_count - step, 1)
-					if _is_impostor:
-						_snap_real.fps = 0
-					else:
-						_snap_impostor.fps = 0
-					_build_level_2()
-			KEY_T:
-				_tinted = not _tinted
-				_apply_tint()
-			KEY_SPACE:
-				_auto_orbit = not _auto_orbit
-			KEY_A:
-				_analytics_visible = not _analytics_visible
-				if _analytics_panel != null:
-					_analytics_panel.visible = _analytics_visible and _ui_visible
-			KEY_H, KEY_TAB:
-				_ui_visible = not _ui_visible
-				_hud.visible = _ui_visible
-				_left_label.visible = _ui_visible and _current_level == 1
-				_right_label.visible = _ui_visible and _current_level == 1
-				if _analytics_panel != null:
-					_analytics_panel.visible = _ui_visible and _analytics_visible
-			KEY_ESCAPE:
-				get_tree().quit()
-
-
-func _apply_quality() -> void:
-	for c in _level2_node.get_children():
-		c.queue_free()
-	if _current_level == 1:
-		_build_level_1()
-	else:
-		_build_level_2()
-
-
-func _apply_tint() -> void:
-	var col := Color(1.0, 0.25, 0.25) if _tinted else Color.WHITE
-	for q in 3:
-		_atlas.get_material(q).set_shader_parameter("tint", col)
+	return "[color=%s]%s[/color]" % [HEX_GOOD if (d > 0.0) == higher_better else HEX_REAL, txt]

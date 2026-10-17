@@ -2,7 +2,7 @@
 class_name OctaDebug
 extends RefCounted
 
-enum Mode { OFF, TINT_BY_LOD, VIEW_INDEX, DEPTH, ORM }
+enum Mode { OFF, TINT_BY_LOD, VIEW_INDEX, DEPTH, ORM, OVERDRAW }
 
 static var mode := Mode.OFF
 
@@ -16,4 +16,4 @@ static func set_mode(m: Mode) -> void:
 
 
 static func mode_names() -> PackedStringArray:
-	return PackedStringArray(["Off", "Tint by quality", "View index", "Depth", "Material (ORM)"])
+	return PackedStringArray(["Off", "Tint by quality", "View index", "Depth", "Material (ORM)", "Overdraw"])

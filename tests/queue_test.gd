@@ -119,11 +119,65 @@ func _run() -> void:
 		await process_frame
 	await process_frame
 	_check(oj.card != null and oj.card.get_parent() == world and oj.card.get_meta(OctaLOD.MODE_META) == OctaLOD.Mode.DUPLICATE, "settings choose LOD mode (DUPLICATE sibling card)")
+	await _cache_limit_test(world, kinds)
+	await _shared_test(world, kinds)
 	print("RESULT %s (%d failures)" % ["PASS" if _fails == 0 else "FAIL", _fails])
 	queue.clear_cache()
 	for k in kinds:
 		k.free()
 	await _clean_quit(1 if _fails else 0)
+
+
+func _cache_limit_test(world: Node3D, kinds: Array[Node3D]) -> void:
+	var lq := OctaBakeQueue.new()
+	lq.cache_limit = 3
+	root.add_child(lq)
+	var small := OctaBakeSettings.new()
+	small.max_atlas_size = 256
+	var order := [0, 1, 2, 0, 3, 1, 0, 2]
+	var want_hit := [false, false, false, true, false, false, true, false]
+	var last := {}
+	var ok := true
+	var size_ok := true
+	for i in order.size():
+		var o: Node3D = kinds[order[i]].duplicate()
+		world.add_child(o)
+		var job := lq.enqueue(o, small)
+		while not lq.is_idle():
+			await process_frame
+		await process_frame
+		var hit: bool = last.has(order[i]) and last[order[i]] == job.atlas
+		ok = ok and job.atlas != null and hit == want_hit[i]
+		size_ok = size_ok and lq.cache_size() <= 3
+		last[order[i]] = job.atlas
+	_check(ok, "cache limit 3 evicts the least recently used atlas (hits on repeat of a recent kind only)")
+	_check(size_ok and lq.cache_size() == 3, "cache never exceeds its limit (size %d)" % lq.cache_size())
+	lq.cache_limit = 1
+	_check(lq.cache_size() == 1, "lowering cache_limit trims the cache immediately")
+	lq.free()
+
+
+func _shared_test(world: Node3D, kinds: Array[Node3D]) -> void:
+	var q := OctaBakeQueue.shared(self)
+	_check(q == OctaBakeQueue.shared(self), "shared() returns the same queue on every call")
+	var small := OctaBakeSettings.new()
+	small.max_atlas_size = 256
+	small.grid_size = 4
+	var o: Node3D = kinds[1].duplicate()
+	world.add_child(o)
+	var job := q.enqueue(o, small)
+	_check(job.running, "enqueue works right after shared(), before the queue joined the tree")
+	await process_frame
+	_check(q.is_inside_tree() and q.get_parent() == root and q.name == "OctaBakeQueueShared", "the shared queue is added under the root")
+	while not q.is_idle():
+		await process_frame
+	await process_frame
+	_check(job.atlas != null and job.card != null and OctaLOD.find_cards(o).size() == 1, "a job on the shared queue bakes and attaches its card")
+	q.free()
+	var again := OctaBakeQueue.shared(self)
+	_check(again != q and is_instance_valid(again), "a new shared queue is made after the old one was freed")
+	await process_frame
+	again.free()
 
 
 func _kind(mesh: Mesh, color: Color) -> Node3D:

@@ -8,8 +8,8 @@ extends MeshInstance3D
 	set(v):
 		atlas = v
 		_refresh()
-## Which object of the atlas this card shows.
-@export var object_index := 0:
+## Which object of the atlas this card shows (0 = the first baked object).
+@export_range(0, 1023) var object_index := 0:
 	set(v):
 		object_index = maxi(v, 0)
 		_refresh()
@@ -28,9 +28,9 @@ extends MeshInstance3D
 ## Calculated from the screen size in Screen size mode.
 @export_range(0.0, 1000.0, 0.5, "or_greater", "suffix:m") var lod_distance := 0.0:
 	get:
-		return visibility_range_begin
+		return visibility_range_begin if is_inside_tree() else _lod_distance
 	set(v):
-		visibility_range_begin = maxf(v, 0.0)
+		_set_begin(v)
 		_apply_fade()
 ## Screen size mode: the card replaces the real mesh when the object covers less than this share
 ## of the screen height (uses the reference field of view, default 75 degrees).
@@ -69,6 +69,8 @@ extends MeshInstance3D
 
 
 var _batch := false
+var _lod_distance := 0.0
+var _checking := false
 
 
 # --- Card setup ---
@@ -77,8 +79,15 @@ func _init() -> void:
 
 
 func _enter_tree() -> void:
+	if lod_mode == OctaLOD.LodMode.DISTANCE:
+		visibility_range_begin = _lod_distance
 	if lod_mode == OctaLOD.LodMode.SCREEN_SIZE or fade != OctaLOD.Fade.NONE:
 		_apply_lod()
+
+
+func _exit_tree() -> void:
+	_lod_distance = visibility_range_begin
+	_checking = false
 
 
 func _validate_property(property: Dictionary) -> void:
@@ -108,7 +117,7 @@ func configure(s: OctaBakeSettings, world_scale: float) -> void:
 	_batch = false
 	if get_meta(OctaLOD.MODE_META, OctaLOD.Mode.DYNAMIC_LOD) == OctaLOD.Mode.DYNAMIC_LOD:
 		if lod_mode == OctaLOD.LodMode.DISTANCE:
-			visibility_range_begin = s.lod_distance
+			_set_begin(s.lod_distance)
 			visibility_range_begin_margin = 1.0
 		_apply_lod(world_scale)
 	else:
@@ -121,7 +130,7 @@ func set_lod(mode: int, distance: float, percent: float) -> void:
 	screen_percent = percent
 	_batch = false
 	if mode == OctaLOD.LodMode.DISTANCE:
-		visibility_range_begin = maxf(distance, 0.0)
+		_set_begin(distance)
 	_apply_lod()
 	notify_property_list_changed()
 
@@ -138,8 +147,13 @@ func _apply_lod(world_scale := -1.0) -> void:
 	if lod_mode == OctaLOD.LodMode.SCREEN_SIZE and get_meta(OctaLOD.MODE_META, OctaLOD.Mode.DYNAMIC_LOD) != OctaLOD.Mode.REPLACE and (world_scale > 0.0 or is_inside_tree()):
 		var r := card_radius(world_scale)
 		if r > 0.0:
-			visibility_range_begin = OctaLOD.distance_for_screen_size(r, screen_percent)
+			_set_begin(OctaLOD.distance_for_screen_size(r, screen_percent))
 	_apply_fade()
+
+
+func _set_begin(distance: float) -> void:
+	_lod_distance = maxf(distance, 0.0)
+	visibility_range_begin = _lod_distance
 
 
 func _apply_fade() -> void:
@@ -166,15 +180,18 @@ func _editor() -> Object:
 	return Engine.get_singleton("EditorInterface") if Engine.is_editor_hint() and Engine.has_singleton("EditorInterface") else null
 
 
-func _check_quality() -> void:
+func _check_quality() -> bool:
 	var ei := _editor()
 	var src := source()
-	if ei == null or src == null:
-		return
+	if _checking or ei == null or src == null:
+		return false
+	_checking = true
 	var r: Dictionary = await OctaQuality.measure(src, ei.get_base_control())
+	_checking = false
 	var msg: String = r.error if r.has("error") else "%s: shape match %.0f%% (worst view %.0f%%), wrong pixels %.1f%%. %s" % [r.name, r.iou * 100.0, r.worst_iou * 100.0, r.bad_pct, r.suggestion]
 	print("Octahedral Impostor LOD quality check - ", msg)
 	ei.get_editor_toaster().push_toast(msg, 0 if r.get("good", false) else 1)
+	return true
 
 
 func _select_source() -> void:

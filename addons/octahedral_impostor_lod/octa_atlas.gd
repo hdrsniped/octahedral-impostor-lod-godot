@@ -12,8 +12,11 @@ const SHADERS := [
 ]
 const SHADER_INCLUDE := "res://addons/octahedral_impostor_lod/shaders/octa_core.gdshaderinc"
 const MAX_OBJECTS := 1024
-const FORMAT_VERSION := 3
+const FORMAT_VERSION := 4
 const CARD_META := &"octa_card"
+const MIN_JOINED_DEPTH := 0.001
+const DEFAULT_SURFACE := Vector4(0.9, 0.0, 0.5, 0.0)
+const DEFAULT_MATERIAL := Vector4(1.0, 0.0, 1.0, 0.0)
 
 @export var format_version := 1
 @export var albedo: Texture2D
@@ -32,7 +35,19 @@ const CARD_META := &"octa_card"
 		write_depth = v
 		for q in materials.size():
 			if materials[q] != null:
-				materials[q].shader = shader_for(q, write_depth)
+				materials[q].shader = shader_for(q, write_depth, -1, precise_search)
+@export var precise_search := false:
+	set(v):
+		precise_search = v
+		for q in materials.size():
+			if materials[q] != null:
+				materials[q].shader = shader_for(q, write_depth, -1, precise_search)
+@export_range(1, 3) var shadow_views := 1:
+	set(v):
+		shadow_views = v
+		for m in materials:
+			if m != null:
+				m.set_shader_parameter("shadow_views", shadow_views)
 @export var object_names := PackedStringArray()
 @export var bounds := PackedVector4Array()
 @export var surface_params := PackedVector4Array()
@@ -48,15 +63,16 @@ static var _live: Array[WeakRef] = []
 
 
 # --- Materials, meshes and cards ---
-static func shader_for(quality: int, depth: bool = true, debug: int = -1) -> Shader:
+static func shader_for(quality: int, depth: bool = true, debug: int = -1, precise: bool = false) -> Shader:
 	if debug < 0:
 		debug = OctaDebug.mode
-	if depth and debug == 0:
+	precise = precise and quality == Quality.ULTRA
+	if depth and debug == 0 and not precise:
 		return SHADERS[quality]
-	var key := quality * 100 + (10 if depth else 0) + debug
+	var key := quality * 100 + (10 if depth else 0) + debug + (1000 if precise else 0)
 	if not _variants.has(key):
 		var s := Shader.new()
-		s.code = "shader_type spatial;\n#define QUALITY %d\n%s#define DEBUG_MODE %d\n#include \"%s\"\n" % [quality, "" if depth else "#define NO_DEPTH_WRITE\n", debug, SHADER_INCLUDE]
+		s.code = "shader_type spatial;\n#define QUALITY %d\n%s%s#define DEBUG_MODE %d\n#include \"%s\"\n" % [quality, "" if depth else "#define NO_DEPTH_WRITE\n", "#define PRECISE_SEARCH\n" if precise else "", debug, SHADER_INCLUDE]
 		_variants[key] = s
 	return _variants[key]
 
@@ -77,17 +93,30 @@ static func refresh_all_materials() -> void:
 	for a in live_atlases():
 		for q in a.materials.size():
 			if a.materials[q] != null:
-				a.materials[q].shader = shader_for(q, a.write_depth)
+				a.materials[q].shader = shader_for(q, a.write_depth, -1, a.precise_search)
 
 
 func vram_bytes() -> int:
 	var total := 0.0
 	for t: Texture2D in [albedo, normal_depth, orm, emission]:
-		if t != null:
-			total += t.get_width() * t.get_height() * 4.0 * 4.0 / 3.0
-	if back_depth != null:
-		total += back_depth.get_width() * back_depth.get_height() * 4.0 / 3.0
+		total += _map_bytes(t, 4.0)
+	total += _map_bytes(back_depth, 1.0)
 	return int(total)
+
+
+func has_half_res_maps() -> bool:
+	for t: Texture2D in [orm, emission]:
+		if t != null and albedo != null and t.get_width() < albedo.get_width():
+			return true
+	return false
+
+
+static func _map_bytes(t: Texture2D, bytes_per_pixel: float) -> float:
+	return 0.0 if t == null else t.get_width() * t.get_height() * bytes_per_pixel * 4.0 / 3.0
+
+
+func card_coverage(object_index: int) -> Dictionary:
+	return OctaCoverage.measure(self, object_index)
 
 
 func object_count() -> int:
@@ -105,7 +134,7 @@ func get_material(quality: Quality = Quality.HIGH) -> ShaderMaterial:
 		materials[quality] = ShaderMaterial.new()
 	if not _live.any(func(w: WeakRef) -> bool: return w.get_ref() == self):
 		_live.append(weakref(self))
-	var want := shader_for(quality, write_depth)
+	var want := shader_for(quality, write_depth, -1, precise_search)
 	if materials[quality].shader != want:
 		materials[quality].shader = want
 	_apply_params(materials[quality])
@@ -118,12 +147,13 @@ func _apply_params(m: ShaderMaterial) -> void:
 	m.set_shader_parameter("grid_size", grid_size)
 	m.set_shader_parameter("hemisphere", hemisphere)
 	m.set_shader_parameter("frame_scale", frame_scale)
+	m.set_shader_parameter("shadow_views", shadow_views)
 	m.set_shader_parameter("obj_data", object_data())
 	m.set_shader_parameter("orm_atlas", orm)
 	m.set_shader_parameter("use_orm", orm != null)
 	m.set_shader_parameter("emission_atlas", emission)
 	m.set_shader_parameter("use_emission", emission != null)
-	if m.shader == shader_for(Quality.ULTRA, write_depth):
+	if m.shader == shader_for(Quality.ULTRA, write_depth, -1, precise_search):
 		m.set_shader_parameter("back_atlas", back_depth)
 		m.set_shader_parameter("use_back_layer", back_depth != null)
 
@@ -136,14 +166,15 @@ func object_data() -> ImageTexture:
 	var cell := Vector2.ONE / Vector2(maxi(tiles.x, 1), maxi(tiles.y, 1))
 	for i in object_count():
 		var b := bounds[i]
-		var sp := surface_params[i] if i < surface_params.size() else Vector4(0.9, 0.0, 0.5, 0.0)
+		var sp := surface_params[i] if i < surface_params.size() else DEFAULT_SURFACE
+		var mp := material_params[i] if i < material_params.size() else DEFAULT_MATERIAL
+		if format_version < 4:
+			mp = Vector4(mp.x, mp.y, 1.0, 0.0)
 		var at := Vector2(i % cols, i / cols) * cell
 		img.set_pixel(0, i, Color(b.x, b.y, b.z, b.w))
 		img.set_pixel(1, i, Color(sp.x, sp.y, sp.z, sp.w))
 		img.set_pixel(2, i, Color(at.x, at.y, cell.x, cell.y))
-		if i < material_params.size():
-			var mp := material_params[i]
-			img.set_pixel(3, i, Color(mp.x, mp.y, mp.z, mp.w))
+		img.set_pixel(3, i, Color(mp.x, mp.y, mp.z, mp.w))
 	_obj_data = ImageTexture.create_from_image(img)
 	return _obj_data
 
@@ -174,6 +205,11 @@ func create_card(index: int, quality: Quality = Quality.HIGH) -> OctaImpostor:
 	return card
 
 
+static func joined_custom(tint: Color, depth: float) -> Color:
+	var lin := tint.srgb_to_linear()
+	return Color(lin.r, lin.g, lin.b, maxf(depth, MIN_JOINED_DEPTH))
+
+
 func create_multimesh(index: int, transforms: Array, quality: Quality = Quality.HIGH, customs: Array = []) -> MultiMeshInstance3D:
 	var mm := MultiMesh.new()
 	mm.transform_format = MultiMesh.TRANSFORM_3D
@@ -183,7 +219,8 @@ func create_multimesh(index: int, transforms: Array, quality: Quality = Quality.
 	for i in transforms.size():
 		mm.set_instance_transform(i, transforms[i])
 		if mm.use_custom_data:
-			mm.set_instance_custom_data(i, customs[i])
+			var c: Color = customs[i]
+			mm.set_instance_custom_data(i, Color(c.r, c.g, c.b, maxf(c.a, MIN_JOINED_DEPTH)))
 	var mmi := MultiMeshInstance3D.new()
 	mmi.name = "ImpostorMultiMesh"
 	mmi.multimesh = mm

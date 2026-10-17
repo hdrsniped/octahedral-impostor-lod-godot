@@ -9,12 +9,27 @@ func _initialize() -> void:
 func _run() -> void:
 	var count: int = 4000
 	var mode: String = "mesh"
+	var shadows: bool = true
+	var shadow_only: bool = false
+	var shadow_views: int = 1
+	var precise: bool = false
+	var extent: float = 300.0
 	var args: PackedStringArray = OS.get_cmdline_user_args()
 	for arg: String in args:
 		if arg.begins_with("--count="):
 			count = int(arg.trim_prefix("--count="))
 		elif arg.begins_with("--mode="):
 			mode = arg.trim_prefix("--mode=")
+		elif arg.begins_with("--shadows="):
+			shadows = arg.trim_prefix("--shadows=") == "1"
+		elif arg.begins_with("--shadow_views="):
+			shadow_views = int(arg.trim_prefix("--shadow_views="))
+		elif arg.begins_with("--shadow_only="):
+			shadow_only = arg.trim_prefix("--shadow_only=") == "1"
+		elif arg.begins_with("--precise="):
+			precise = arg.trim_prefix("--precise=") == "1"
+		elif arg.begins_with("--extent="):
+			extent = float(arg.trim_prefix("--extent="))
 
 	if "--uncapped" in args:
 		DisplayServer.window_set_vsync_mode(DisplayServer.VSYNC_DISABLED)
@@ -34,7 +49,7 @@ func _run() -> void:
 
 	var light: DirectionalLight3D = DirectionalLight3D.new()
 	light.rotation_degrees = Vector3(-50.0, 30.0, 0.0)
-	light.shadow_enabled = true
+	light.shadow_enabled = shadows
 	root.add_child(light)
 
 	var ground: MeshInstance3D = MeshInstance3D.new()
@@ -56,13 +71,13 @@ func _run() -> void:
 
 	var cols: int = maxi(1, int(ceil(sqrt(float(count)))))
 	var rows: int = maxi(1, int(ceil(float(count) / float(cols))))
-	var cell_w: float = 300.0 / float(cols)
-	var cell_d: float = 300.0 / float(rows)
+	var cell_w: float = extent / float(cols)
+	var cell_d: float = extent / float(rows)
 
 	for i: int in range(count):
 		var col: int = i % cols
 		var row: int = i / cols
-		var x: float = -150.0 + (float(col) + rng.randf()) * cell_w
+		var x: float = -extent * 0.5 + (float(col) + rng.randf()) * cell_w
 		var z: float = 0.0 + (float(row) + rng.randf()) * cell_d
 		var yaw: float = rng.randf_range(-PI, PI)
 		var s: float = rng.randf_range(0.6, 1.6)
@@ -84,7 +99,12 @@ func _run() -> void:
 	else:
 		var q: int = {"low": 0, "medium": 1, "high": 2, "ultra": 3}.get(mode, 2)
 		var atlas: OctaAtlas = await OctaBaker.bake([DemoObjects.rock(1)], root)
-		root.add_child(atlas.create_multimesh(0, transforms, q))
+		atlas.precise_search = precise
+		atlas.get_material(q as OctaAtlas.Quality).set_shader_parameter("shadow_views", shadow_views)
+		var field: MultiMeshInstance3D = atlas.create_multimesh(0, transforms, q)
+		if shadow_only:
+			field.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_SHADOWS_ONLY
+		root.add_child(field)
 
 	var rid: RID = root.get_viewport_rid()
 	RenderingServer.viewport_set_measure_render_time(rid, true)
@@ -137,8 +157,10 @@ func _run() -> void:
 	if frame_ms_avg > 0.0:
 		fps = 1000.0 / frame_ms_avg
 
-	print("PERF mode=%s count=%d gpu_ms_avg=%.2f gpu_ms_p95=%.2f cpu_ms_avg=%.2f frame_ms_avg=%.2f fps=%.2f prims=%d draws=%d" % [
+	print("PERF mode=%s shadows=%s shadow_only=%s count=%d gpu_ms_avg=%.2f gpu_ms_p95=%.2f cpu_ms_avg=%.2f frame_ms_avg=%.2f fps=%.2f prims=%d draws=%d" % [
 		mode,
+		shadows,
+		shadow_only,
 		count,
 		gpu_ms_avg,
 		gpu_ms_p95,

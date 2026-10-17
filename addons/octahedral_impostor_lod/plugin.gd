@@ -1,7 +1,31 @@
 @tool
 extends EditorPlugin
 
-enum { BAKE, REMOVE, CHECK, SCENE, JOIN, REBAKE, HELP }
+enum { BAKE, REMOVE, CHECK, SCENE, JOIN, REBAKE, HELP, GROUP, REBAKE_ALL, SELECT_ALL }
+
+const HELP_TEXT := """[b]Menu (3D toolbar)[/b]
+[b]Bake Selected...[/b]  Bake the selected objects with the dialog settings. Pick a preset, then change anything (hover an option for help).
+[b]Bake Scene...[/b]  Checklist of every object with its on-screen size; small ones are pre-ticked. A group is one item.
+[b]Bake Group[/b]  Bake the selected OctaImpostorGroup with its own settings.
+[b]Re-bake Selected / Re-bake All Impostors in Scene[/b]  Bake again with the settings saved in each atlas (or its group). Properties you changed on a card are kept.
+[b]Join Selected Impostors[/b]  Merge nearby cards of one object into a MultiMesh (one draw call).
+[b]Remove Impostors from Selected[/b]  Delete cards and restore the real objects.
+[b]Check Quality of Selected[/b]  Compare card and real mesh from 8 angles.
+[b]Select Impostors in Scene[/b]  Select every card of the open scene.
+All of these can be undone with Edit > Undo.
+
+[b]Impostors dock[/b]
+Batch-edit the selected cards (quality, LOD, fade). Atlas options apply to every card of the atlas: write depth, precise search, shadow views. The Group section bakes the selected OctaImpostorGroup. Debug view: Off, Tint by quality, View index, Depth, Material (ORM), Overdraw. The Atlas block shows format version, maps, half-res, write depth, shadow views, precise search and video memory.
+
+[b]Options worth knowing[/b]
+Quality Low, Medium, High, Ultra. Ultra + Complex shapes (split parts, back layer, precise search) fixes rings and see-through shapes; precise search is 2-3x slower on the GPU, use it for hero objects.
+Half-res material maps store roughness, metallic, occlusion and emission at a quarter of the memory.
+Shadow views 1-3: more views = smoother shadows when the light moves.
+LOD by distance or by screen size (project setting octa_lod/reference_fov).
+
+[b]Command line and runtime[/b]
+godot --path <project> -s res://addons/octahedral_impostor_lod/tools/octa_bake_cli.gd -- --help
+OctaBakeQueue.shared(get_tree()).enqueue(node) bakes at runtime within a frame budget."""
 
 var _menu: MenuButton
 var _dialog: ConfirmationDialog
@@ -14,6 +38,7 @@ var _progress_label: Label
 var _job: OctaBakeJob
 var _dock: Control
 var _picker: ConfirmationDialog
+var _help: AcceptDialog
 var _settings := OctaBakeSettings.new()
 var _busy := false
 
@@ -26,14 +51,21 @@ func _enter_tree() -> void:
 	var pm := _menu.get_popup()
 	pm.add_item("Bake Selected...", BAKE)
 	pm.add_item("Bake Scene...", SCENE)
-	pm.add_item("Remove Impostors from Selected", REMOVE)
-	pm.add_item("Join Selected Impostors", JOIN)
-	pm.add_item("Re-bake Selected Impostors", REBAKE)
-	pm.add_item("Check Quality of Selected", CHECK)
+	pm.add_item("Bake Group", GROUP)
 	pm.add_separator()
-	pm.add_item("Help (README)", HELP)
+	pm.add_item("Re-bake Selected Impostors", REBAKE)
+	pm.add_item("Re-bake All Impostors in Scene", REBAKE_ALL)
+	pm.add_item("Join Selected Impostors", JOIN)
+	pm.add_item("Remove Impostors from Selected", REMOVE)
+	pm.add_separator()
+	pm.add_item("Check Quality of Selected", CHECK)
+	pm.add_item("Select Impostors in Scene", SELECT_ALL)
+	pm.add_separator()
+	pm.add_item("Help...", HELP)
 	pm.id_pressed.connect(_on_menu)
 	add_control_to_container(CONTAINER_SPATIAL_EDITOR_MENU, _menu)
+	Engine.set_meta(OctaImpostorGroup.PLUGIN_META, self)
+	_register_settings()
 
 	_dialog = ConfirmationDialog.new()
 	_dialog.title = "Bake Octahedral Impostors"
@@ -46,9 +78,10 @@ func _enter_tree() -> void:
 	row.add_child(pl)
 	_preset = OptionButton.new()
 	_preset.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	for preset_name in OctaBakeSettings.PRESET_NAMES:
-		_preset.add_item(preset_name)
-	_preset.tooltip_text = "Fills in the settings below for a typical use. Change anything afterwards."
+	for k in OctaBakeSettings.PRESET_NAMES.size():
+		_preset.add_item(OctaBakeSettings.PRESET_NAMES[k])
+		_preset.set_item_tooltip(k, OctaBakeSettings.PRESET_TIPS[k])
+	_preset.tooltip_text = "Fills in quality, atlas, depth, fade, shadow and complex-shape options for a typical use. It never changes the placement (mode, LOD distance). Change anything afterwards."
 	_preset.item_selected.connect(_on_preset)
 	row.add_child(_preset)
 	box.add_child(row)
@@ -67,6 +100,7 @@ func _enter_tree() -> void:
 	_load_settings()
 	_inspector.edit(_settings)
 	_build_progress()
+	_build_help()
 	_picker = preload("res://addons/octahedral_impostor_lod/octa_scene_picker.gd").new()
 	_picker.chosen.connect(_on_picked)
 	EditorInterface.get_base_control().add_child(_picker)
@@ -75,11 +109,14 @@ func _enter_tree() -> void:
 
 
 func _exit_tree() -> void:
+	_busy = false
+	Engine.remove_meta(OctaImpostorGroup.PLUGIN_META)
 	remove_control_from_container(CONTAINER_SPATIAL_EDITOR_MENU, _menu)
 	_menu.queue_free()
 	_dialog.queue_free()
 	_progress.queue_free()
 	_picker.queue_free()
+	_help.queue_free()
 	remove_control_from_docks(_dock)
 	_dock.queue_free()
 
@@ -89,6 +126,8 @@ func _on_menu(id: int) -> void:
 		BAKE:
 			if _busy:
 				_toast("A bake is already running.", EditorToaster.SEVERITY_WARNING)
+			elif _selected().is_empty() and not _selected_groups().is_empty():
+				bake_selected_groups(false)
 			elif _selected().is_empty():
 				_toast("Select one or more 3D objects with meshes first.", EditorToaster.SEVERITY_WARNING)
 			else:
@@ -102,16 +141,30 @@ func _on_menu(id: int) -> void:
 			join_cards(selected_cards())
 		REBAKE:
 			rebake(selected_cards())
+		REBAKE_ALL:
+			rebake_scene()
+		SELECT_ALL:
+			select_scene_cards()
+		GROUP:
+			bake_selected_groups(false)
 		CHECK:
 			_check()
 		HELP:
-			OS.shell_open(ProjectSettings.globalize_path("res://addons/octahedral_impostor_lod/README.md"))
+			_help.popup_centered()
 
 
 func _selected() -> Array[Node3D]:
 	var out: Array[Node3D] = []
 	for n in EditorInterface.get_selection().get_top_selected_nodes():
-		if n is Node3D and not n.has_meta(OctaAtlas.CARD_META):
+		if n is Node3D and not n.has_meta(OctaAtlas.CARD_META) and not n is OctaImpostorGroup:
+			out.append(n)
+	return out
+
+
+func _selected_groups() -> Array[OctaImpostorGroup]:
+	var out: Array[OctaImpostorGroup] = []
+	for n in EditorInterface.get_selection().get_top_selected_nodes():
+		if n is OctaImpostorGroup and not out.has(n):
 			out.append(n)
 	return out
 
@@ -121,7 +174,7 @@ func _update_info() -> void:
 	var names := ", ".join(nodes.slice(0, 5).map(func(n: Node) -> String: return n.name))
 	if nodes.size() > 5:
 		names += ", ..."
-	_info.text = "Selected: %s\n%s\n%s" % [names, _settings.describe(nodes.size()), _settings.cost_text()]
+	_info.text = "Selected: %s\n%s\n%s" % [names, _settings.describe(nodes.size(), nodes), _settings.cost_text(nodes)]
 
 
 func _on_preset(i: int) -> void:
@@ -131,8 +184,32 @@ func _on_preset(i: int) -> void:
 	_update_info()
 
 
+
 func open_bake_dialog() -> void:
 	_on_menu(BAKE)
+
+
+# --- Help and project setting ---
+func _build_help() -> void:
+	_help = AcceptDialog.new()
+	_help.title = "Octahedral Impostor LOD - Help"
+	_help.ok_button_text = "Close"
+	_help.min_size = Vector2i(Vector2(620, 560) * EditorInterface.get_editor_scale())
+	var text := RichTextLabel.new()
+	text.bbcode_enabled = true
+	text.text = HELP_TEXT.replace("\r", "")
+	text.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	_help.add_child(text)
+	_help.add_button("Open README", false, "readme")
+	_help.custom_action.connect(func(_a: StringName) -> void: OS.shell_open(ProjectSettings.globalize_path("res://addons/octahedral_impostor_lod/README.md")))
+	EditorInterface.get_base_control().add_child(_help)
+
+
+func _register_settings() -> void:
+	if not ProjectSettings.has_setting(OctaLOD.FOV_SETTING):
+		ProjectSettings.set_setting(OctaLOD.FOV_SETTING, OctaLOD.DEFAULT_FOV)
+	ProjectSettings.set_initial_value(OctaLOD.FOV_SETTING, OctaLOD.DEFAULT_FOV)
+	ProjectSettings.add_property_info({name = OctaLOD.FOV_SETTING, type = TYPE_FLOAT, hint = PROPERTY_HINT_RANGE, hint_string = "10,120,0.5,suffix:deg"})
 
 
 # --- Progress ---
@@ -176,31 +253,83 @@ func _bake() -> void:
 
 
 func rebake(cards: Array) -> void:
-	var nodes: Array[Node3D] = []
-	var settings: OctaBakeSettings = null
+	var root := EditorInterface.get_edited_scene_root()
+	var by_atlas := {}
+	var groups: Array[OctaImpostorGroup] = []
 	for c in cards:
-		if c is OctaImpostor and c.atlas != null and c.atlas.bake_settings != null:
-			settings = c.atlas.bake_settings
-			var src := _source_of(c)
-			if src != null and not nodes.has(src):
-				nodes.append(src)
-	if nodes.is_empty() or settings == null:
+		if not c is OctaImpostor:
+			continue
+		var src := _source_of(c)
+		var group := OctaImpostorGroup.group_of(src, root) if src != null and root != null else null
+		if group != null:
+			if not groups.has(group):
+				groups.append(group)
+		elif src != null and c.atlas != null and c.atlas.bake_settings != null:
+			if not by_atlas.has(c.atlas):
+				var list: Array[Node3D] = []
+				by_atlas[c.atlas] = list
+			if not by_atlas[c.atlas].has(src):
+				by_atlas[c.atlas].append(src)
+	if by_atlas.is_empty() and groups.is_empty():
 		_toast("Select impostor cards that still have their source object to re-bake them.", EditorToaster.SEVERITY_WARNING)
 		return
-	_run_bake(nodes, settings.duplicate())
+	for g in groups:
+		await bake_group(g, true)
+	for a: OctaAtlas in by_atlas:
+		await _run_bake(by_atlas[a], a.bake_settings.duplicate(), null, true)
 
 
-func _run_bake(nodes: Array[Node3D], s: OctaBakeSettings) -> void:
+func rebake_scene() -> void:
+	await rebake(scene_cards())
+
+
+func scene_cards() -> Array:
+	var root := EditorInterface.get_edited_scene_root()
+	return [] if root == null else root.find_children("*", "OctaImpostor", true, false)
+
+
+func select_scene_cards() -> void:
+	var cards := scene_cards()
+	if cards.is_empty():
+		_toast("This scene has no impostor cards.", EditorToaster.SEVERITY_WARNING)
+		return
+	var sel := EditorInterface.get_selection()
+	sel.clear()
+	for c in cards:
+		sel.add_node(c)
+
+
+func bake_selected_groups(keep_overrides: bool) -> void:
+	var groups := _selected_groups()
+	if groups.is_empty():
+		_toast("Select an OctaImpostorGroup node first.", EditorToaster.SEVERITY_WARNING)
+		return
+	for g in groups:
+		await bake_group(g, keep_overrides)
+
+
+func bake_group(group: OctaImpostorGroup, keep_overrides := false) -> bool:
+	if _busy:
+		_toast("A bake is already running.", EditorToaster.SEVERITY_WARNING)
+		return false
+	var nodes := group.target_nodes()
+	if nodes.is_empty():
+		_toast("Group '%s' has no objects to bake. Add meshes as children or fill in its Targets." % group.name, EditorToaster.SEVERITY_WARNING)
+		return false
+	return await _run_bake(nodes, group.effective_settings().duplicate(), group, keep_overrides)
+
+
+func _run_bake(nodes: Array[Node3D], s: OctaBakeSettings, group: OctaImpostorGroup = null, keep_overrides := false) -> bool:
 	var root := EditorInterface.get_edited_scene_root()
 	if root == null or _busy:
-		return
+		return false
 	for n in nodes:
 		if not OctaLOD.geometry_below(n).any(func(g: Node) -> bool: return g is MeshInstance3D and g.mesh != null and g.is_visible_in_tree()):
 			_toast("'%s' has no visible mesh to bake (select the object that contains the MeshInstance3D)." % n.name, EditorToaster.SEVERITY_ERROR)
-			return
+			return false
 		if n == root and not OctaLOD.is_child_card(n, s.mode):
 			_toast("'%s' is the scene root; this mode needs a parent. Select a child node instead." % n.name, EditorToaster.SEVERITY_ERROR)
-			return
+			return false
 	var targets: Array[Node3D] = []
 	var bake_list: Array[Node3D] = []
 	var index: Array[int] = []
@@ -220,12 +349,12 @@ func _run_bake(nodes: Array[Node3D], s: OctaBakeSettings) -> void:
 			index.append(seen[key])
 	if bake_list.size() > OctaAtlas.MAX_OBJECTS:
 		_toast("Bake at most %d different objects at a time." % OctaAtlas.MAX_OBJECTS, EditorToaster.SEVERITY_ERROR)
-		return
+		return false
 
 	var scene_name := root.scene_file_path.get_file().get_basename()
 	if scene_name.is_empty():
 		scene_name = String(root.name)
-	var base := s.output_dir.path_join("%s_%s" % [scene_name.to_snake_case(), String(nodes[0].name).to_snake_case()])
+	var base := s.output_dir.path_join("%s_%s" % [scene_name.to_snake_case(), String((group if group != null else nodes[0]).name).to_snake_case()])
 	var path := base + ".res"
 	var i := 2
 	while ResourceLoader.exists(path):
@@ -248,29 +377,42 @@ func _run_bake(nodes: Array[Node3D], s: OctaBakeSettings) -> void:
 			_toast("Bake cancelled. Nothing was changed.", EditorToaster.SEVERITY_WARNING)
 		else:
 			_toast("Bake failed. See the Output panel for the reason.", EditorToaster.SEVERITY_ERROR)
-		return
+		return false
 	EditorInterface.get_resource_filesystem().scan()
 	if root != EditorInterface.get_edited_scene_root() or not bake_list.all(func(n: Node) -> bool: return is_instance_valid(n)):
 		_toast("The scene changed during the bake; the atlas was saved to %s but no cards were added." % path, EditorToaster.SEVERITY_WARNING)
-		return
+		return false
 
 	var ur := get_undo_redo()
 	ur.create_action("Bake Octahedral Impostors")
 	var replaced: Array[Node3D] = []
+	var old_sources: Array[Node3D] = []
+	var overrides := {}
 	for o in nodes:
 		for card in OctaLOD.find_cards_below(o):
 			if not replaced.has(card):
-				_remove_card_actions(ur, _source_of(card), card)
+				var old_src := _source_of(card)
+				if keep_overrides and old_src != null:
+					overrides[old_src] = OctaLOD.card_overrides(card)
+				_remove_do_actions(ur, old_src, card)
 				replaced.append(card)
+				old_sources.append(old_src)
 	for k in targets.size():
 		var src := targets[k]
-		_add_card_actions(ur, root, src, atlas.create_card(index[k], s.quality), atlas.card_transform(src), s, replaced)
+		var kept: Dictionary = overrides.get(src, {})
+		_add_card_actions(ur, root, src, atlas.create_card(index[k], kept.get("quality", s.quality)), atlas.card_transform(src), s, replaced, kept)
+	if group != null:
+		ur.add_do_property(group, "atlas", atlas)
+		ur.add_undo_property(group, "atlas", group.atlas)
+	for k in replaced.size():
+		_remove_undo_actions(ur, old_sources[k], replaced[k])
 	ur.commit_action()
 	_toast("Baked %d object(s) into %s (%s)." % [bake_list.size(), path, s.describe(bake_list.size()).get_slice(" -> ", 1)])
 	_dock.refresh()
+	return true
 
 
-func _add_card_actions(ur: EditorUndoRedoManager, root: Node, src: Node3D, card: MeshInstance3D, xform: Transform3D, s: OctaBakeSettings, replacing: Array) -> void:
+func _add_card_actions(ur: EditorUndoRedoManager, root: Node, src: Node3D, card: MeshInstance3D, xform: Transform3D, s: OctaBakeSettings, replacing: Array, kept := {}) -> void:
 	var as_child := OctaLOD.is_child_card(src, s.mode)
 	var parent := src if as_child else src.get_parent()
 	if as_child:
@@ -287,11 +429,12 @@ func _add_card_actions(ur: EditorUndoRedoManager, root: Node, src: Node3D, card:
 	ur.add_undo_method(parent, "remove_child", card)
 	var cs := card.transform.basis.get_scale().abs()
 	card.configure(s, OctaLOD.world_scale(parent) * maxf(cs.x, maxf(cs.y, cs.z)))
+	OctaLOD.apply_overrides(card, kept)
 	if s.mode == OctaLOD.Mode.DYNAMIC_LOD:
 		for gi in OctaLOD.geometry_below(src):
 			var hops := _depth(src, gi) + (0 if as_child else 1)
 			ur.add_do_property(gi, "visibility_parent", NodePath("../".repeat(hops) + String(card.name)))
-			ur.add_undo_property(gi, "visibility_parent", gi.visibility_parent)
+			ur.add_undo_property(gi, "visibility_parent", NodePath() if gi.get_node_or_null(gi.visibility_parent) in replacing else gi.visibility_parent)
 	elif s.mode == OctaLOD.Mode.REPLACE:
 		ur.add_do_property(src, "visible", false)
 		ur.add_undo_property(src, "visible", src.visible)
@@ -306,6 +449,11 @@ func _add_card_actions(ur: EditorUndoRedoManager, root: Node, src: Node3D, card:
 
 # --- Remove ---
 func _remove_card_actions(ur: EditorUndoRedoManager, src: Node3D, card: Node) -> void:
+	_remove_undo_actions(ur, src, card)
+	_remove_do_actions(ur, src, card)
+
+
+func _remove_undo_actions(ur: EditorUndoRedoManager, src: Node3D, card: Node) -> void:
 	var parent := card.get_parent()
 	ur.add_undo_method(parent, "add_child", card)
 	ur.add_undo_method(parent, "move_child", card, card.get_index())
@@ -314,11 +462,19 @@ func _remove_card_actions(ur: EditorUndoRedoManager, src: Node3D, card: Node) ->
 	if src != null:
 		for gi in OctaLOD.geometry_below(src):
 			if gi.get_node_or_null(gi.visibility_parent) == card:
-				ur.add_do_property(gi, "visibility_parent", NodePath())
 				ur.add_undo_property(gi, "visibility_parent", gi.visibility_parent)
 		if card.get_meta(OctaLOD.MODE_META, OctaLOD.Mode.DYNAMIC_LOD) == OctaLOD.Mode.REPLACE:
-			ur.add_do_property(src, "visible", true)
 			ur.add_undo_property(src, "visible", src.visible)
+
+
+func _remove_do_actions(ur: EditorUndoRedoManager, src: Node3D, card: Node) -> void:
+	var parent := card.get_parent()
+	if src != null:
+		for gi in OctaLOD.geometry_below(src):
+			if gi.get_node_or_null(gi.visibility_parent) == card:
+				ur.add_do_property(gi, "visibility_parent", NodePath())
+		if card.get_meta(OctaLOD.MODE_META, OctaLOD.Mode.DYNAMIC_LOD) == OctaLOD.Mode.REPLACE:
+			ur.add_do_property(src, "visible", true)
 	ur.add_do_method(parent, "remove_child", card)
 
 
@@ -327,6 +483,9 @@ func _remove() -> void:
 	for n in EditorInterface.get_selection().get_top_selected_nodes():
 		if n.has_meta(OctaAtlas.CARD_META):
 			pairs[n] = _source_of(n)
+		elif n is OctaImpostorGroup:
+			for card in n.cards():
+				pairs[card] = _source_of(card)
 		elif n is Node3D:
 			for card in OctaLOD.find_cards_below(n):
 				pairs[card] = _source_of(card)
@@ -368,7 +527,7 @@ func join_cards(cards: Array) -> void:
 		var customs: Array = []
 		for c: OctaImpostor in g:
 			xforms.append(root.global_transform.affine_inverse() * c.global_transform)
-			customs.append(Color(c.tint.r, c.tint.g, c.tint.b, maxf(c.depth_multiplier, 0.001)))
+			customs.append(OctaAtlas.joined_custom(c.tint, c.depth_multiplier))
 		var mmi := first.atlas.create_multimesh(first.object_index, xforms, first.quality, customs)
 		var nm := "OctaJoined_%d" % (draw_calls + 1)
 		var i := 2
@@ -404,7 +563,7 @@ func selected_cards() -> Array:
 			if not out.has(n):
 				out.append(n)
 		elif n is Node3D:
-			for c in OctaLOD.find_cards_below(n):
+			for c in (n.cards() if n is OctaImpostorGroup else OctaLOD.find_cards_below(n)):
 				if not out.has(c):
 					out.append(c)
 	return out
@@ -430,22 +589,28 @@ func _on_picked(nodes: Array) -> void:
 	if nodes.is_empty():
 		_toast("Nothing was ticked, so nothing was baked.", EditorToaster.SEVERITY_WARNING)
 		return
+	for n in nodes:
+		if n is OctaImpostorGroup:
+			await bake_group(n)
+	var plain := nodes.filter(func(n: Node) -> bool: return not n is OctaImpostorGroup)
+	if plain.is_empty():
+		return
 	var sel := EditorInterface.get_selection()
 	sel.clear()
-	for n in nodes:
+	for n in plain:
 		sel.add_node(n)
 	_on_menu(BAKE)
 
 
 # --- Quality check ---
-func _check() -> void:
+func _check() -> bool:
 	if _busy:
 		_toast("A bake or check is already running.", EditorToaster.SEVERITY_WARNING)
-		return
+		return false
 	var nodes := _selected()
 	if nodes.is_empty():
 		_toast("Select baked objects to check.", EditorToaster.SEVERITY_WARNING)
-		return
+		return false
 	_busy = true
 	for n in nodes:
 		var r: Dictionary = await OctaQuality.measure(n, EditorInterface.get_base_control())
@@ -456,6 +621,7 @@ func _check() -> void:
 		print("Octahedral Impostor LOD quality check - ", msg)
 		_toast(msg, EditorToaster.SEVERITY_INFO if r.good else EditorToaster.SEVERITY_WARNING)
 	_busy = false
+	return true
 
 
 # --- Helpers ---

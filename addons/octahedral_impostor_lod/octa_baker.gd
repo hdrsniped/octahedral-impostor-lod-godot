@@ -11,6 +11,17 @@ const MAP_SHADERS := {
 	true: preload("res://addons/octahedral_impostor_lod/shaders/capture_material_disabled.gdshader"),
 }
 const BACK_SHADER := preload("res://addons/octahedral_impostor_lod/shaders/capture_cull_front.gdshader")
+const CONSTANT_TOLERANCE := 0.15
+const CONSTANT_AO := 1.0
+const CAMERA_DISTANCE := 3.0
+const CLIP_MARGIN := 1.1
+const MIN_RADIUS := 0.001
+const MIN_NEAR := 0.001
+const MAX_ATLAS_SIDE := 16384
+const MAX_PAD_FRACTION := 0.25
+const MIN_MAP_FRAME := 4
+const TRANSPARENT_CUT := 0.5
+const LUMA := Vector4(0.2126, 0.7152, 0.0722, 0)
 
 
 # --- Bake ---
@@ -24,14 +35,15 @@ static func bake(sources: Array, host: Node, settings: OctaBakeSettings = null, 
 		push_error("Octahedral Impostor LOD: the host node must be inside the scene tree.")
 		return null
 	var entries: Array[Dictionary] = []
+	var mesh_cache := {}
 	for s: Node3D in sources:
-		var e := _collect(s, settings.split_parts)
+		var e := _collect(s, settings.split_parts, mesh_cache)
 		if e.parts.is_empty():
 			push_error("Octahedral Impostor LOD: '%s' has no visible MeshInstance3D to bake." % s.name)
 			return null
 		entries.append(e)
 
-	var want_orm := settings.material_maps
+	var want_orm := settings.material_maps and _needs_material_map(entries)
 	var want_em := false
 	if settings.emission:
 		for e in entries:
@@ -40,16 +52,19 @@ static func bake(sources: Array, host: Node, settings: OctaBakeSettings = null, 
 	var n := settings.grid_size
 	var l := settings.layout(count)
 	var fr: int = l.frame
-	if l.side > 16384:
+	if l.side > MAX_ATLAS_SIDE:
 		push_error("Octahedral Impostor LOD: the atlas would be %d px wide (limit 16384). Lower frame_resolution or bake fewer objects." % l.side)
 		return null
-	var pad := minf(settings.padding_px, fr * 0.25)
+	var pad := minf(settings.padding_px, fr * MAX_PAD_FRACTION)
 	var frame_scale := fr / (fr - 2.0 * pad)
+	var fm := map_frame_resolution(fr, settings.half_res_material_maps)
 
 	var atlas := OctaAtlas.new()
 	atlas.format_version = OctaAtlas.FORMAT_VERSION
 	atlas.bake_settings = settings.duplicate()
 	atlas.write_depth = settings.write_depth
+	atlas.precise_search = settings.precise_search
+	atlas.shadow_views = settings.shadow_views
 	atlas.grid_size = n
 	atlas.hemisphere = settings.hemisphere
 	atlas.parent_space = settings.split_parts
@@ -59,8 +74,8 @@ static func bake(sources: Array, host: Node, settings: OctaBakeSettings = null, 
 	var img_a := Image.create_empty(l.cols * n * fr, l.rows * n * fr, false, Image.FORMAT_RGBA8)
 	var img_n := Image.create_empty(l.cols * n * fr, l.rows * n * fr, false, Image.FORMAT_RGBA8)
 	var img_b: Image = Image.create_empty(l.cols * n * fr, l.rows * n * fr, false, Image.FORMAT_RGBA8) if settings.back_layer else null
-	var img_o: Image = Image.create_empty(l.cols * n * fr, l.rows * n * fr, false, Image.FORMAT_RGBA8) if want_orm else null
-	var img_e: Image = Image.create_empty(l.cols * n * fr, l.rows * n * fr, false, Image.FORMAT_RGBA8) if want_em else null
+	var img_o: Image = Image.create_empty(l.cols * n * fm, l.rows * n * fm, false, Image.FORMAT_RGBA8) if want_orm else null
+	var img_e: Image = Image.create_empty(l.cols * n * fm, l.rows * n * fm, false, Image.FORMAT_RGBA8) if want_em else null
 
 	var rig := Node.new()
 	rig.name = "_OctaBakeRig"
@@ -97,9 +112,9 @@ static func bake(sources: Array, host: Node, settings: OctaBakeSettings = null, 
 		if world_b != null:
 			vps_b.append(_make_viewport(rig, fr, world_b, true, settings.msaa))
 		if world_o != null:
-			vps_o.append(_make_viewport(rig, fr, world_o, true, settings.msaa))
+			vps_o.append(_make_viewport(rig, fm, world_o, true, settings.msaa))
 		if world_e != null:
-			vps_e.append(_make_viewport(rig, fr, world_e, true, settings.msaa))
+			vps_e.append(_make_viewport(rig, fm, world_e, true, settings.msaa))
 	var low_cpu := OS.low_processor_usage_mode
 	OS.low_processor_usage_mode = false
 	await _tick(job, true)
@@ -112,13 +127,13 @@ static func bake(sources: Array, host: Node, settings: OctaBakeSettings = null, 
 		atlas.object_names.append(e.name)
 		atlas.bounds.append(b)
 		atlas.surface_params.append(e.surface)
-		atlas.material_params.append(Vector4(maxf(e.emit_scale, 1.0), e.ao_affect, 0.0, 0.0))
+		atlas.material_params.append(Vector4(maxf(e.emit_scale, 1.0), e.ao_affect, e.ao_const, 0.0))
 		_fill_holders(e, holder_a, holder_n, holder_b, holder_o, holder_e)
 		await _tick(job, false)
 		if job != null and job.cancelled:
 			return _abort(rig, low_cpu)
 		var center := Vector3(b.x, b.y, b.z)
-		var dist := b.w * 3.0
+		var dist := b.w * CAMERA_DISTANCE
 		for mat: ShaderMaterial in e.capture_mats:
 			mat.set_shader_parameter("cam_dist", dist)
 			mat.set_shader_parameter("radius", b.w)
@@ -142,8 +157,8 @@ static func bake(sources: Array, host: Node, settings: OctaBakeSettings = null, 
 					var cam: Camera3D = vp.get_child(0)
 					cam.transform = Transform3D(OctaAtlas.frame_basis(d), center + d * dist)
 					cam.size = 2.0 * b.w * frame_scale
-					cam.near = maxf(dist - b.w * 1.1, 0.001)
-					cam.far = dist + b.w * 1.1
+					cam.near = maxf(dist - b.w * CLIP_MARGIN, MIN_NEAR)
+					cam.far = dist + b.w * CLIP_MARGIN
 					vp.render_target_update_mode = SubViewport.UPDATE_ONCE
 			await _tick(job, true)
 			if not is_instance_valid(rig) or not rig.is_inside_tree():
@@ -158,10 +173,11 @@ static func bake(sources: Array, host: Node, settings: OctaBakeSettings = null, 
 				_blit(vps_n[j], img_n, fr, at)
 				if img_b != null:
 					_blit(vps_b[j], img_b, fr, at)
+				var at_m := (tile * n + Vector2i((f + j) % n, (f + j) / n)) * fm
 				if img_o != null:
-					_blit(vps_o[j], img_o, fr, at)
+					_blit(vps_o[j], img_o, fm, at_m)
 				if img_e != null:
-					_blit(vps_e[j], img_e, fr, at)
+					_blit(vps_e[j], img_e, fm, at_m)
 			if job != null:
 				job.progress.emit(oi * n * n + f + batch, count * n * n, "%s (%d of %d)" % [e.name, oi + 1, count])
 			f += batch
@@ -278,19 +294,24 @@ static func _blit(vp: SubViewport, into: Image, size: int, at: Vector2i) -> void
 
 
 # --- Source collection ---
-static func _collect(source: Node3D, parent_space := false) -> Dictionary:
+static func _collect(source: Node3D, parent_space := false, cache := {}) -> Dictionary:
 	var parts: Array[Dictionary] = []
 	var skipped := PackedStringArray()
 	_walk(source, Transform3D(source.basis, Vector3.ZERO) if parent_space else Transform3D.IDENTITY, parts, skipped, true)
 	if not skipped.is_empty():
 		push_warning("Octahedral Impostor LOD: '%s': only MeshInstance3D nodes are baked; skipped %s." % [source.name, ", ".join(skipped)])
-	var e := {name = String(source.name), parts = parts, bounds = Vector4(), surface = Vector4(0.9, 0.0, 0.5, 0.0), capture_mats = [], emit_scale = 0.0, ao_affect = 0.0}
+	var e := {name = String(source.name), parts = parts, bounds = Vector4(), surface = OctaAtlas.DEFAULT_SURFACE, capture_mats = [], emit_scale = 0.0, ao_affect = 0.0, ao_const = CONSTANT_AO, textured = false, spread = 0.0}
 	if parts.is_empty():
 		return e
 	var verts := PackedVector3Array()
 	for p in parts:
-		for s in p.mesh.get_surface_count():
-			verts.append_array(p.xform * (p.mesh.surface_get_arrays(s)[Mesh.ARRAY_VERTEX] as PackedVector3Array))
+		var key := [p.mesh, p.xform]
+		if not cache.has(key):
+			var placed := PackedVector3Array()
+			for s in p.mesh.get_surface_count():
+				placed.append_array(p.xform * (p.mesh.surface_get_arrays(s)[Mesh.ARRAY_VERTEX] as PackedVector3Array))
+			cache[key] = placed
+		verts.append_array(cache[key])
 	var aabb := AABB(verts[0], Vector3.ZERO)
 	for v in verts:
 		aabb = aabb.expand(v)
@@ -298,8 +319,16 @@ static func _collect(source: Node3D, parent_space := false) -> Dictionary:
 	var r2 := 0.0
 	for v in verts:
 		r2 = maxf(r2, c.distance_squared_to(v))
-	e.bounds = Vector4(c.x, c.y, c.z, maxf(sqrt(r2), 0.001))
+	e.bounds = Vector4(c.x, c.y, c.z, maxf(sqrt(r2), MIN_RADIUS))
+	_scan_materials(parts, e)
+	return e
+
+
+# --- Material constants ---
+static func _scan_materials(parts: Array[Dictionary], e: Dictionary) -> void:
 	var acc := Vector3.ZERO
+	var lo := Vector2(INF, INF)
+	var hi := Vector2(-INF, -INF)
 	var nmat := 0
 	var ao_sum := 0.0
 	var ao_n := 0
@@ -308,7 +337,11 @@ static func _collect(source: Node3D, parent_space := false) -> Dictionary:
 			var m: Material = p.mats[s]
 			if m is BaseMaterial3D:
 				acc += Vector3(m.roughness, m.metallic, m.metallic_specular)
+				lo = lo.min(Vector2(m.roughness, m.metallic))
+				hi = hi.max(Vector2(m.roughness, m.metallic))
 				nmat += 1
+				if _has_map_texture(m):
+					e.textured = true
 				if _emits(m):
 					e.emit_scale = maxf(e.emit_scale, m.emission_energy_multiplier)
 				if m.ao_enabled:
@@ -319,7 +352,46 @@ static func _collect(source: Node3D, parent_space := false) -> Dictionary:
 	if nmat > 0:
 		acc /= nmat
 		e.surface = Vector4(acc.x, acc.y, acc.z, 0.0)
-	return e
+		e.spread = maxf(hi.x - lo.x, hi.y - lo.y)
+
+
+static func _has_map_texture(m: BaseMaterial3D) -> bool:
+	if m is ORMMaterial3D and m.get("orm_texture") != null:
+		return true
+	return m.roughness_texture != null or m.metallic_texture != null or (m.ao_enabled and m.ao_texture != null)
+
+
+static func _needs_material_map(entries: Array[Dictionary]) -> bool:
+	for e in entries:
+		if e.textured or e.spread > CONSTANT_TOLERANCE:
+			return true
+	return false
+
+
+static func _scan_sources(sources: Array, split_parts: bool) -> Array[Dictionary]:
+	var entries: Array[Dictionary] = []
+	for s: Node3D in sources:
+		var parts: Array[Dictionary] = []
+		_walk(s, Transform3D(s.basis, Vector3.ZERO) if split_parts else Transform3D.IDENTITY, parts, PackedStringArray(), true)
+		var e := {textured = false, spread = 0.0, surface = OctaAtlas.DEFAULT_SURFACE, emit_scale = 0.0, ao_affect = 0.0}
+		_scan_materials(parts, e)
+		entries.append(e)
+	return entries
+
+
+static func needs_material_map(sources: Array, split_parts := false) -> bool:
+	return _needs_material_map(_scan_sources(sources, split_parts))
+
+
+static func has_mixed_constants(sources: Array, split_parts := false) -> bool:
+	for e in _scan_sources(sources, split_parts):
+		if e.spread > CONSTANT_TOLERANCE:
+			return true
+	return false
+
+
+static func map_frame_resolution(frame: int, half: bool) -> int:
+	return maxi((frame + 1) / 2, MIN_MAP_FRAME) if half else frame
 
 
 static func _walk(node: Node, xform: Transform3D, parts: Array[Dictionary], skipped: PackedStringArray, is_root: bool) -> void:
@@ -463,7 +535,7 @@ static func _capture_material(m: Material, back := false) -> ShaderMaterial:
 				cut = m.alpha_scissor_threshold
 			BaseMaterial3D.TRANSPARENCY_ALPHA, BaseMaterial3D.TRANSPARENCY_ALPHA_HASH, \
 			BaseMaterial3D.TRANSPARENCY_ALPHA_DEPTH_PRE_PASS:
-				cut = 0.5
+				cut = TRANSPARENT_CUT
 		sm.set_shader_parameter("alpha_cut", cut)
 		sm.set_shader_parameter("albedo_tex", m.albedo_texture)
 		sm.set_shader_parameter("albedo_color", m.albedo_color)
@@ -487,7 +559,7 @@ static func _channel(c: int) -> Vector4:
 			return Vector4(0, 0, 1, 0)
 		BaseMaterial3D.TEXTURE_CHANNEL_ALPHA:
 			return Vector4(0, 0, 0, 1)
-	return Vector4(0.2126, 0.7152, 0.0722, 0)
+	return LUMA
 
 
 static func _map_material(m: Material, mode: int) -> ShaderMaterial:

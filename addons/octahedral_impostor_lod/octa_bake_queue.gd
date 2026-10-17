@@ -4,12 +4,22 @@ extends Node
 signal baked(source: Node3D, card: Node3D)
 signal finished
 
-const KEY_PROPERTIES := ["grid_size", "hemisphere", "max_atlas_size", "material_maps", "emission", "split_parts",
-		"back_layer", "search_steps", "layer_tolerance", "frame_resolution", "msaa", "padding_px", "write_depth", "compression"]
+const KEY_PROPERTIES := ["grid_size", "hemisphere", "max_atlas_size", "material_maps", "emission", "half_res_material_maps", "split_parts",
+		"back_layer", "search_steps", "layer_tolerance", "frame_resolution", "msaa", "padding_px", "write_depth", "precise_search", "shadow_views", "compression"]
 
-@export_range(0.1, 16.0, 0.1, "suffix:ms") var budget_ms := 2.0
+## Milliseconds per frame the queue may spend baking. Lower = smoother frames, slower bakes.
+@export_range(0.1, 16.0, 0.1, "or_greater", "suffix:ms") var budget_ms := 2.0
+## Most views rendered in one frame (lowered automatically when the measured cost is high).
 @export_range(1, 64) var max_views_per_frame := 8
+## Identical objects with the same settings share one baked atlas.
 @export var dedupe := true
+## Most atlases kept for reuse by identical objects. The least recently used one is dropped first.
+@export_range(1, 1024) var cache_limit := 32:
+	set(v):
+		cache_limit = maxi(v, 1)
+		_trim_cache()
+
+static var _shared: OctaBakeQueue
 
 var last_frame_usec := 0
 var max_frame_usec := 0
@@ -21,6 +31,21 @@ var _groups := {}
 var _cache := {}
 var _busy := false
 var _per_view_usec := 0.0
+var _joining := false
+
+
+# --- Shared queue ---
+static func shared(tree: SceneTree) -> OctaBakeQueue:
+	if not is_instance_valid(_shared):
+		_shared = OctaBakeQueue.new()
+		_shared.name = "OctaBakeQueueShared"
+		_shared._joining = true
+		tree.root.add_child.call_deferred(_shared)
+	return _shared
+
+
+func _enter_tree() -> void:
+	_joining = false
 
 
 # --- Requests ---
@@ -28,7 +53,7 @@ func enqueue(source: Node3D, settings: OctaBakeSettings = null, save_path := "")
 	var job := OctaBakeJob.new()
 	if settings == null:
 		settings = OctaBakeSettings.new()
-	if source == null or not source.is_inside_tree() or not is_inside_tree():
+	if source == null or not source.is_inside_tree() or not (is_inside_tree() or _joining):
 		push_error("Octahedral Impostor LOD: the queue and the source must be inside the scene tree.")
 		_fail(job)
 		return job
@@ -38,7 +63,10 @@ func enqueue(source: Node3D, settings: OctaBakeSettings = null, save_path := "")
 	var req := {job = job, source = source, settings = settings}
 	_busy = true
 	if dedupe and _cache.has(key):
-		_attach.append({req = req, atlas = _cache[key].atlas})
+		var hit: Dictionary = _cache[key]
+		_cache.erase(key)
+		_cache[key] = hit
+		_attach.append({req = req, atlas = hit.atlas})
 		return job
 	if dedupe and _groups.has(key):
 		_groups[key].requests.append(req)
@@ -63,6 +91,10 @@ func is_idle() -> bool:
 
 func clear_cache() -> void:
 	_cache.clear()
+
+
+func cache_size() -> int:
+	return _cache.size()
 
 
 func reset_stats() -> void:
@@ -144,7 +176,9 @@ func _finish_group(g: Dictionary, atlas: OctaAtlas) -> void:
 		else:
 			_fail(r.job)
 	if atlas != null and dedupe:
+		_cache.erase(g.key)
 		_cache[g.key] = {atlas = atlas, keep = g.keep}
+		_trim_cache()
 
 
 func _attach_one() -> void:
@@ -211,6 +245,11 @@ func _settings_key(s: OctaBakeSettings) -> String:
 	for p in KEY_PROPERTIES:
 		values.append(s.get(p))
 	return str(values.hash())
+
+
+func _trim_cache() -> void:
+	while _cache.size() > cache_limit:
+		_cache.erase(_cache.keys()[0])
 
 
 func _keep_alive(source: Node3D) -> Array:
