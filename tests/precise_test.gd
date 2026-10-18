@@ -21,14 +21,17 @@ func _check(ok: bool, what: String) -> void:
 # --- Precise ray search: variant plumbing and accuracy on the rings ---
 func _run() -> void:
 	var ultra := OctaAtlas.Quality.ULTRA
-	var plain := OctaAtlas.shader_for(ultra, true, 0, false)
-	var precise := OctaAtlas.shader_for(ultra, true, 0, true)
+	var plain := OctaAtlas.shader_variant(ultra, true, 0)
+	var precise := OctaAtlas.shader_variant(ultra, true, 0, OctaAtlas.V_PRECISE)
 	_check(plain == OctaAtlas.SHADERS[ultra], "precise off keeps the shipped Ultra shader resource")
 	_check(precise != plain and precise.code.contains("#define PRECISE_SEARCH"), "precise on is its own compile-time variant")
-	_check(precise == OctaAtlas.shader_for(ultra, true, 0, true), "the precise variant is cached")
-	_check(OctaAtlas.shader_for(ultra, false, 0, true).code.contains("NO_DEPTH_WRITE") and OctaAtlas.shader_for(ultra, false, 0, true).code.contains("PRECISE_SEARCH"), "precise combines with flat depth")
+	_check(precise == OctaAtlas.shader_variant(ultra, true, 0, OctaAtlas.V_PRECISE), "the precise variant is cached")
+	_check(OctaAtlas.shader_variant(ultra, false, 0, OctaAtlas.V_PRECISE).code.contains("NO_DEPTH_WRITE") and OctaAtlas.shader_variant(ultra, false, 0, OctaAtlas.V_PRECISE).code.contains("PRECISE_SEARCH"), "precise combines with flat depth")
+	_check(OctaAtlas.shader_variant(OctaAtlas.Quality.ULTRA, true, 0, OctaAtlas.V_VISIBILITY) == OctaAtlas.SHADERS[OctaAtlas.Quality.ULTRA], "visibility weighting is ignored at Ultra")
+	_check(OctaAtlas.shader_variant(OctaAtlas.Quality.HIGH, true, 0, OctaAtlas.V_PYRAMID) == OctaAtlas.SHADERS[OctaAtlas.Quality.HIGH], "coverage pyramid is ignored below Ultra")
 	for q in [OctaAtlas.Quality.LOW, OctaAtlas.Quality.MEDIUM, OctaAtlas.Quality.HIGH]:
-		_check(OctaAtlas.shader_for(q, true, 0, true) == OctaAtlas.SHADERS[q], "precise is ignored below Ultra (quality %d)" % q)
+		_check(OctaAtlas.shader_variant(q, true, 0, OctaAtlas.V_PRECISE) == OctaAtlas.SHADERS[q], "precise is ignored below Ultra (quality %d)" % q)
+	_check(OctaAtlas.shader_for(ultra, true, 0, true, false, false, false, false, false) == precise and OctaAtlas.shader_for(OctaAtlas.Quality.HIGH, true, 0, false, false, false, false, true, false) == OctaAtlas.SHADERS[OctaAtlas.Quality.HIGH], "shader_for delegates its positional flags to shader_variant")
 
 	var world := Node3D.new()
 	root.add_child(world)

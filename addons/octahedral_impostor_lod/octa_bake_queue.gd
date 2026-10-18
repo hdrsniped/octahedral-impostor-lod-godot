@@ -5,7 +5,8 @@ signal baked(source: Node3D, card: Node3D)
 signal finished
 
 const KEY_PROPERTIES := ["grid_size", "hemisphere", "max_atlas_size", "material_maps", "emission", "half_res_material_maps", "split_parts",
-		"back_layer", "search_steps", "layer_tolerance", "frame_resolution", "msaa", "padding_px", "write_depth", "precise_search", "shadow_views", "compression"]
+		"back_layer", "search_steps", "layer_tolerance", "frame_resolution", "msaa", "padding_px", "write_depth", "precise_search", "shadow_views", "compression",
+		"view_visibility", "coverage_pyramid", "parallax_refine"]
 
 ## Milliseconds per frame the queue may spend baking. Lower = smoother frames, slower bakes.
 @export_range(0.1, 16.0, 0.1, "or_greater", "suffix:ms") var budget_ms := 2.0

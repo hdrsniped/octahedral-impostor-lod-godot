@@ -154,3 +154,51 @@ static func textured() -> Node3D:
 
 static func all() -> Array:
 	return [rock(), tree(), rings()]
+
+
+static func custom() -> Node3D:
+	return _custom_object("Custom", 0.35, 0.0, Color.BLACK)
+
+
+static func custom_shiny() -> Node3D:
+	return _custom_object("Custom_Shiny", 0.05, 1.0, Color(2.0, 0.4, 0.2))
+
+
+static func custom_hooked() -> Node3D:
+	var sh := Shader.new()
+	sh.code = "shader_type spatial;\n#include \"res://addons/octahedral_impostor_lod/shaders/octa_bake_hook.gdshaderinc\"\nvoid fragment() {\n\tvec3 c = abs(NORMAL) * 0.5 + 0.2;\n\tALBEDO = c;\n\tROUGHNESS = 0.05;\n\tMETALLIC = 1.0;\n\tEMISSION = vec3(2.0, 0.4, 0.2);\n\tOCTA_BAKE_OUTPUT(c, ROUGHNESS, METALLIC, 1.0, EMISSION);\n}\n"
+	var mat := ShaderMaterial.new()
+	mat.shader = sh
+	var sphere := SphereMesh.new()
+	sphere.radius = 1.0
+	sphere.height = 2.0
+	sphere.radial_segments = 96
+	sphere.rings = 48
+	sphere.material = mat
+	var mi := MeshInstance3D.new()
+	mi.mesh = sphere
+	mi.position.y = 1.0
+	var root := Node3D.new()
+	root.name = "Custom_Hooked"
+	root.add_child(mi)
+	return root
+
+
+static func _custom_object(label: String, rough: float, metal: float, glow: Color) -> Node3D:
+	var sh := Shader.new()
+	sh.code = "shader_type spatial;\nvoid fragment() {\n\tALBEDO = abs(NORMAL) * 0.5 + 0.2;\n\tROUGHNESS = %f;\n\tMETALLIC = %f;\n\tEMISSION = vec3(%f, %f, %f);\n}\n" % [rough, metal, glow.r, glow.g, glow.b]
+	var mat := ShaderMaterial.new()
+	mat.shader = sh
+	var sphere := SphereMesh.new()
+	sphere.radius = 1.0
+	sphere.height = 2.0
+	sphere.radial_segments = 96
+	sphere.rings = 48
+	sphere.material = mat
+	var mi := MeshInstance3D.new()
+	mi.mesh = sphere
+	mi.position.y = 1.0
+	var root := Node3D.new()
+	root.name = label
+	root.add_child(mi)
+	return root

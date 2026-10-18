@@ -4,18 +4,20 @@ extends RefCounted
 
 const COVERED := 0.5
 const SIMPLIFY_EPS := 1e-6
+const MEAN_STRIDE := 4
 
 static var _mean_cache := {}
 
 
 # --- Coverage of one object ---
-static func measure(atlas: OctaAtlas, index: int, full := true) -> Dictionary:
+static func measure(atlas: OctaAtlas, index: int, full := true, stride := 1) -> Dictionary:
 	var out := {}
 	if atlas == null or atlas.normal_depth == null or index < 0 or index >= atlas.object_count():
 		return out
 	var img := atlas.normal_depth.get_image()
 	if img == null:
 		return out
+	img.clear_mipmaps()
 	if img.is_compressed():
 		img.decompress()
 	img.convert(Image.FORMAT_RGBA8)
@@ -29,20 +31,25 @@ static func measure(atlas: OctaAtlas, index: int, full := true) -> Dictionary:
 	var lo := ceili(pad - 0.001)
 	var hi := floori(fr - pad + 0.001)
 	var quad_px := float(hi - lo) * float(hi - lo)
+	var step := maxi(stride, 1)
 	var union := PackedByteArray()
-	union.resize(fr * fr)
+	if full:
+		union.resize(fr * fr)
 	var view_sum := 0.0
 	var thr := int(COVERED * 255.0)
 	for f in n * n:
 		var at := (tile * n + Vector2i(f % n, f / n)) * fr
 		var count := 0
-		for y in range(lo, hi):
+		var total := 0
+		for y in range(lo, hi, step):
 			var row := ((at.y + y) * width + at.x) * 4 + 3
-			for x in range(lo, hi):
+			for x in range(lo, hi, step):
+				total += 1
 				if data[row + x * 4] >= thr:
 					count += 1
-					union[y * fr + x] = 1
-		view_sum += count / quad_px
+					if full:
+						union[y * fr + x] = 1
+		view_sum += count / float(maxi(total, 1))
 	var mean_view := view_sum / float(n * n)
 	out.mean_view = mean_view
 	_mean_cache[_key(atlas, index)] = mean_view
@@ -94,7 +101,7 @@ static func measure(atlas: OctaAtlas, index: int, full := true) -> Dictionary:
 static func mean_covered(atlas: OctaAtlas, index: int) -> float:
 	var key := _key(atlas, index)
 	if not _mean_cache.has(key):
-		var m := measure(atlas, index, false)
+		var m := measure(atlas, index, false, MEAN_STRIDE)
 		return m.get("mean_view", 1.0)
 	return _mean_cache[key]
 

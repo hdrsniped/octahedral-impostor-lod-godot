@@ -37,11 +37,15 @@ func _run() -> void:
 	settings.back_layer = _arg("back", "0") == "1"
 	settings.search_steps = int(_arg("steps", "8"))
 	settings.precise_search = _arg("precise", "0") == "1"
+	settings.view_visibility = _arg("vis", "0") == "1"
+	settings.coverage_pyramid = _arg("pyramid", "0") == "1"
+	settings.parallax_refine = _arg("parallax", "0") == "1"
 	settings.layer_tolerance = float(_arg("tol", "0.15"))
 	settings.padding_px = int(_arg("pad", "2"))
 	settings.half_res_material_maps = _arg("half", "1") == "1"
 	settings.material_maps = _arg("maps", "1") == "1"
 	settings.max_atlas_size = int(_arg("atlas", "2048"))
+	settings.write_depth = _arg("depth", "1") == "1"
 	var split := _arg("split", "0") == "1"
 	settings.split_parts = split
 	if _arg("far", "0") == "1":
@@ -51,6 +55,12 @@ func _run() -> void:
 	var pool := DemoObjects.all()
 	if only == "textured" or _arg("textured", "0") == "1":
 		pool.append(DemoObjects.textured())
+	if only == "custom" or _arg("custom", "0") == "1":
+		pool.append(DemoObjects.custom())
+	if only == "custom_shiny" or _arg("custom_shiny", "0") == "1":
+		pool.append(DemoObjects.custom_shiny())
+	if only == "custom_hooked" or _arg("custom_hooked", "0") == "1":
+		pool.append(DemoObjects.custom_hooked())
 	var objs := pool.filter(func(o: Node3D) -> bool: return only.is_empty() or String(o.name).to_lower() == only)
 	var groups := []
 	var sources: Array[Node3D] = []

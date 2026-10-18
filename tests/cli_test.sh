@@ -9,7 +9,7 @@ mkdir -p tests/cli_tmp
 cp tests/editor_selftest/scene_template.tscn.txt tests/cli_tmp/scene.tscn
 "$GODOT" --headless --path . --import > /dev/null 2>&1
 fails=0
-"$GODOT" --path . -s $CLI -- --scene=res://tests/cli_tmp/scene.tscn --nodes=Ball,Ring --preset=balanced --out=res://tests/cli_tmp/out/ --save-scene > tests/cli_tmp/log.txt 2>&1
+"$GODOT" --path . -s $CLI -- --scene=res://tests/cli_tmp/scene.tscn --nodes=Ball,Ring --preset=fast --out=res://tests/cli_tmp/out/ --save-scene > tests/cli_tmp/log.txt 2>&1
 code=$?
 if [ $code -eq 0 ] && [ -f tests/cli_tmp/out/scene_ball.res ] && [ "$(grep -c octa_source tests/cli_tmp/scene.tscn)" = "2" ]; then echo "PASS bake and save scene"; else echo "FAIL bake and save scene (exit $code)"; fails=1; fi
 "$GODOT" --path . -s $CLI -- --scene=res://tests/cli_tmp/scene.tscn --nodes=Missing > tests/cli_tmp/log2.txt 2>&1
@@ -58,7 +58,7 @@ if [ $code -eq 0 ] && grep -q "grid 12" tests/cli_tmp/log5.txt && ! grep -q "gri
 "$GODOT" --path . -s $CLI -- --help > tests/cli_tmp/log6.txt 2>&1
 code=$?
 missing=""
-for opt in scene nodes preset save-scene ignore-groups mode strip-source lod-mode lod-distance lod-screen-percent fade fade-margin quality write-depth split-parts back-layer search-steps precise-search layer-tolerance dedupe scene-pick-percent join-cell grid-size hemisphere max-atlas-size atlas-size material-maps emission half-res-material-maps compression output-dir out shadow-views frame-resolution msaa padding-px batch-size help; do
+for opt in scene nodes preset save-scene pack ignore-groups mode strip-source lod-mode lod-distance lod-screen-percent fade fade-margin quality write-depth split-parts back-layer search-steps precise-search layer-tolerance dedupe scene-pick-percent join-cell join-adaptive join-region-size join-region-count grid-size hemisphere max-atlas-size atlas-size material-maps emission half-res-material-maps compression output-dir out shadow-views wind-strength frame-resolution msaa padding-px batch-size help; do
 	grep -q -- "--$opt" tests/cli_tmp/log6.txt || missing="$missing $opt"
 done
 if [ $code -eq 0 ] && [ -z "$missing" ]; then echo "PASS --help exits 0 and lists every option"; else echo "FAIL --help (exit $code, missing:$missing)"; fails=1; fi
@@ -72,6 +72,42 @@ cp tests/editor_selftest/scene_template.tscn.txt tests/cli_tmp/flags.tscn
 "$GODOT" --path . -s $CLI -- --scene=res://tests/cli_tmp/flags.tscn --nodes=Ball --grid-size=4 --max-atlas-size=512 --shadow-views=2 --quality=ultra --precise-search --no-dedupe --no-half-res-material-maps --out=res://tests/cli_tmp/fout/ > tests/cli_tmp/log9.txt 2>&1
 code=$?
 if [ $code -eq 0 ] && grep -q "grid 4" tests/cli_tmp/log9.txt && [ -f tests/cli_tmp/fout/flags_ball.res ]; then echo "PASS generic setting flags reach the bake"; else echo "FAIL generic setting flags (exit $code)"; fails=1; fi
+cat > tests/cli_tmp/pack.tscn <<'SCENE'
+[gd_scene load_steps=6 format=3]
+
+[ext_resource type="Script" path="res://addons/octahedral_impostor_lod/octa_impostor_group.gd" id="1"]
+[ext_resource type="Script" path="res://addons/octahedral_impostor_lod/octa_bake_settings.gd" id="2"]
+
+[sub_resource type="Resource" id="settings"]
+script = ExtResource("2")
+grid_size = 6
+frame_resolution = 64
+max_atlas_size = 512
+
+[sub_resource type="SphereMesh" id="sphere"]
+
+[sub_resource type="BoxMesh" id="box"]
+
+[node name="Root" type="Node3D"]
+
+[node name="Props" type="Node3D" parent="."]
+script = ExtResource("1")
+settings = SubResource("settings")
+
+[node name="A" type="MeshInstance3D" parent="Props"]
+mesh = SubResource("box")
+
+[node name="B" type="MeshInstance3D" parent="Props"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 2, 0, 0)
+mesh = SubResource("sphere")
+
+[node name="Ball" type="MeshInstance3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -3, 0, 0)
+mesh = SubResource("sphere")
+SCENE
+"$GODOT" --path . -s $CLI -- --scene=res://tests/cli_tmp/pack.tscn --grid-size=6 --frame-resolution=64 --atlas-size=512 --out=res://tests/cli_tmp/pkout/ --pack --save-scene > tests/cli_tmp/log10.txt 2>&1
+code=$?
+if [ $code -eq 0 ] && grep -q "packed 2 atlas(es) into 1 shared atlas(es)" tests/cli_tmp/log10.txt && [ -f tests/cli_tmp/pkout/pack_packed.res ] && grep -q "pack_packed.res" tests/cli_tmp/pack.tscn && ! grep -q "pack_props.res" tests/cli_tmp/pack.tscn && ! grep -q "pack_ball.res" tests/cli_tmp/pack.tscn && [ "$(grep -c octa_source tests/cli_tmp/pack.tscn)" = "3" ]; then echo "PASS --pack merges the run's atlases and the saved scene uses them"; else echo "FAIL --pack (exit $code)"; fails=1; fi
 rm -rf tests/cli_tmp
 echo "RESULT $([ $fails -eq 0 ] && echo PASS || echo FAIL)"
 exit $fails

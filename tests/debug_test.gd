@@ -67,6 +67,52 @@ func _run() -> void:
 	vp.add_child(hud)
 	var st := hud.scan()
 	_check(st.cards == 1 and st.atlases >= 1 and st.vram_mb > 0.0 and st.impostor_visible == 1, "HUD counts cards, atlases and VRAM (%s)" % [st])
+
+	var rng := RandomNumberGenerator.new()
+	rng.seed = 7
+	var ok_churn := true
+	for round in 6:
+		var groups: Array[MultiMeshInstance3D] = []
+		for g in 3:
+			var xf: Array = []
+			for i in 5:
+				xf.append(Transform3D(Basis(), Vector3(rng.randf_range(-2, 2), 0, rng.randf_range(-2, 2))))
+			var grp := atlas.create_multimesh(0, xf, OctaAtlas.Quality.HIGH, [], 0.0, 0.0, 0.5 if g < 2 else 0.0)
+			vp.add_child(grp)
+			groups.append(grp)
+		var pending := groups.duplicate()
+		pending.shuffle()
+		for grp in pending:
+			var seen := hud.scan()
+			ok_churn = ok_churn and seen.cards >= 1
+			if rng.randf() < 0.5:
+				grp.queue_free()
+				await process_frame
+			else:
+				grp.get_parent().remove_child(grp)
+				var after := hud.scan()
+				ok_churn = ok_churn and after.cards >= 1
+				grp.free()
+		hud.scan()
+		await process_frame
+		ok_churn = ok_churn and atlas.wind_counts() == Vector2i(0, 0) and not atlas.wind_active()
+	_check(ok_churn, "HUD scans while joined wind groups are freed in random order (6 rounds), wind registry ends empty and the plain shader returns")
+	ball.visible = true
+	var temp_atlas: OctaAtlas = await OctaLOD.generate([ball], vp, s)
+	ball.visible = false
+	var temp_grp := temp_atlas.create_multimesh(0, [Transform3D()], OctaAtlas.Quality.HIGH, [], 0.0, 0.0, 0.5)
+	vp.add_child(temp_grp)
+	hud.scan()
+	temp_atlas = null
+	temp_grp.free()
+	var live := OctaAtlas.live_atlases()
+	var st2 := hud.scan()
+	_check(live.size() == st2.atlases and st2.cards >= 1, "HUD survives an atlas whose last joined group was freed (%d live)" % live.size())
+	var first := OctaCoverage.mean_covered(atlas, 0)
+	var t0 := Time.get_ticks_usec()
+	for i in 200:
+		OctaCoverage.mean_covered(atlas, 0)
+	_check(first > 0.0 and first <= 1.0 and Time.get_ticks_usec() - t0 < 50000, "coverage mean is cached after the first read (%.3f)" % first)
 	print("RESULT %s (%d failures)" % ["PASS" if _fails == 0 else "FAIL", _fails])
 	for c in root.get_children():
 		c.queue_free()

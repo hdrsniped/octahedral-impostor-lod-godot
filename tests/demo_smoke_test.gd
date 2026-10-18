@@ -95,7 +95,7 @@ func _layout() -> Array:
 
 func _shader_ok(card: Node) -> bool:
 	var a: OctaAtlas = _scene._atlas
-	return card.material_override.shader == OctaAtlas.shader_for(card.quality, a.write_depth, -1, a.precise_search)
+	return card.material_override.shader == OctaAtlas.shader_for(card.quality, a.write_depth, -1, a.precise_search, a.card_fade and not OctaLOD.fade_supported())
 
 
 # --- Keys that exist on both levels ---
@@ -166,9 +166,16 @@ func _common(level: int) -> void:
 	await _key(KEY_R, 20)
 	_check(s._sun_spin and not is_equal_approx(sun.rotation.y, yaw), tag + "sun spin rotates the light")
 	await _key(KEY_R)
+	var asset_before: int = s._current_asset
+	await _key(KEY_2)
+	await _key(KEY_K)
+	_check(s._wind and _cards().all(func(c: OctaImpostor) -> bool: return is_equal_approx(c.wind_strength, s.WIND_STRENGTH)) and a.get_material(s._quality).shader.code.contains("CARD_WIND") and s._state_text(s._draws()).contains("Wind: ON"), tag + "wind key sways the tree cards (wind variant, HUD line)")
+	await _key(KEY_K)
+	_check(not s._wind and _cards().all(func(c: OctaImpostor) -> bool: return c.wind_strength == 0.0) and not a.wind_active() and not a.get_material(s._quality).shader.code.contains("CARD_WIND") and s._state_text(s._draws()).contains("Wind: OFF"), tag + "wind key off returns the normal shader")
+	await _key(KEY_1 + asset_before)
 
 	await _key(KEY_O, 8)
-	var fade_ok: bool = _cards().all(func(c: OctaImpostor) -> bool: return c.fade == (OctaLOD.Fade.CROSSFADE if OctaLOD.fade_supported() else OctaLOD.Fade.NONE))
+	var fade_ok: bool = _cards().all(func(c: OctaImpostor) -> bool: return c.fade == OctaLOD.Fade.CROSSFADE)
 	_check(s._auto_lod and _cards().all(func(c: OctaImpostor) -> bool: return is_equal_approx(c.visibility_range_begin, s.LOD_DISTANCE) and c.visible) and fade_ok, tag + "auto LOD sets the visibility range on every card")
 	_check(_reals().all(func(r: Node3D) -> bool: return r.visible and OctaLOD.geometry_below(r).all(func(g: GeometryInstance3D) -> bool: return not g.visibility_parent.is_empty())), tag + "auto LOD links the real meshes to their cards")
 	var seen: Dictionary = s._scan_hud.scan()
@@ -214,7 +221,7 @@ func _run() -> void:
 	_scene = load("res://demo/showcase.tscn").instantiate()
 	root.add_child(_scene)
 	var s := _scene
-	for k in [KEY_D, KEY_EQUAL, KEY_F4, KEY_B, KEY_J, KEY_O, KEY_T, KEY_A, KEY_H, KEY_G, KEY_P, KEY_S, KEY_L]:
+	for k in [KEY_D, KEY_EQUAL, KEY_F4, KEY_B, KEY_J, KEY_O, KEY_T, KEY_A, KEY_H, KEY_G, KEY_P, KEY_S, KEY_L, KEY_C]:
 		await _key(k, 1)
 	_check(s._atlas == null and OctaDebug.mode == OctaDebug.Mode.OFF and s._spawn_count == 1 and not s._simulating_benchmark and not s._tinted and s._analytics_visible and s._ui_visible and s._current_level == 2, "keys pressed while loading are ignored")
 	var n := 0
@@ -318,6 +325,16 @@ func _run() -> void:
 	_check(not s._simulating_benchmark and s._is_impostor, "benchmark finishes and keys work again")
 	await _key(KEY_F)
 	await _key(KEY_F)
+
+	await _key(KEY_C, 30)
+	var t_chunk := Time.get_ticks_msec()
+	while (s._chunk_group == null or s._chunk_group.chunk_card() == null) and Time.get_ticks_msec() - t_chunk < 60000:
+		await process_frame
+	var cg: OctaImpostorGroup = s._chunk_group
+	_check(cg != null and cg.chunk_card() != null and cg.chunk_atlas != null and is_equal_approx(cg.chunk_card().visibility_range_begin, s.CHUNK_DISTANCE), "C builds a chunk LOD group with a chunk card beyond %d m" % s.CHUNK_DISTANCE)
+	_check(cg != null and cg.target_nodes().size() == s.CHUNK_PROPS and cg.cards().size() == s.CHUNK_PROPS + 1 and s._toast_label.text.contains("Chunk LOD") and s._state_text(s._draws()).contains("Chunk: %d props" % s.CHUNK_PROPS), "chunk group has %d object cards, one chunk card, a toast and a HUD row" % s.CHUNK_PROPS)
+	await _key(KEY_C, 20)
+	_check(s._chunk_group == null and not is_instance_valid(cg), "C again removes the chunk demo")
 
 	await _key(KEY_L)
 	_check(s._current_level == 1 and s._level1_node.visible and not s._level2_node.visible and s._field.get_child_count() == 0 and s._sides[0].get_child_count() == 2, "L switches to Level 1")

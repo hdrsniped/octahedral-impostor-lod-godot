@@ -67,7 +67,7 @@ func populate(root: Node, s: OctaBakeSettings) -> void:
 			cards += OctaLOD.find_cards_below(m).size()
 			for gi in OctaLOD.geometry_below(m):
 				if gi is MeshInstance3D and gi.mesh != null:
-					tris += gi.mesh.get_faces().size() / 3
+					tris += OctaLOD.triangle_count(gi.mesh)
 		row.set_text(3, str(tris))
 		row.set_meta("pct", 0.0)
 		row.set_meta("cards", cards)

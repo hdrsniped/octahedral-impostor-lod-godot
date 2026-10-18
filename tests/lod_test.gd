@@ -104,24 +104,21 @@ func _run() -> void:
 	frock.scale = Vector3.ONE * 44.0 / 12.0
 	vp.add_child(frock)
 	var fcard: OctaImpostor = OctaLOD.attach_card(frock, atlas, 0, OctaLOD.Mode.DYNAMIC_LOD, 40.0, OctaAtlas.Quality.HIGH, null, fs)
-	var fmode_ok := fcard.visibility_range_fade_mode == (GeometryInstance3D.VISIBILITY_RANGE_FADE_SELF if OctaLOD.fade_supported() else GeometryInstance3D.VISIBILITY_RANGE_FADE_DISABLED)
-	_check(fmode_ok and absf(fcard.visibility_range_begin - 40.0) < 0.001 and absf(fcard.visibility_range_begin_margin - (10.0 if OctaLOD.fade_supported() else 1.0)) < 0.001, "DYNAMIC_LOD card gets fade mode and margin (supported here: %s)" % OctaLOD.fade_supported())
+	var fmode_ok := fcard.visibility_range_fade_mode == GeometryInstance3D.VISIBILITY_RANGE_FADE_SELF
+	_check(fmode_ok and absf(fcard.visibility_range_begin - 40.0) < 0.001 and absf(fcard.visibility_range_begin_margin - 10.0) < 0.001, "DYNAMIC_LOD card gets fade mode and margin (fade kind here: %s)" % OctaLOD.fade_kind())
 	for i in 6:
 		await RenderingServer.frame_post_draw
 	var fimg := vp.get_texture().get_image()
 	var fb := atlas.bounds[0]
 	var fpx := Vector2i(cam.unproject_position(frock.global_transform * Vector3(fb.x, fb.y, fb.z)))
 	var fred := _red_fraction(fimg, fpx, 6)
-	if OctaLOD.fade_supported():
-		_check(fred > 0.1 and fred < 0.95, "card and mesh are dithered together inside the fade zone (card share %.2f)" % fred)
-	else:
-		_check(fred > 0.95 or fred < 0.05, "no fade renderer pops between mesh and card (card share %.2f)" % fred)
+	_check(fred > 0.1 and fred < 0.95, "card and mesh are dithered together inside the fade zone (card share %.2f)" % fred)
 	frock.queue_free()
 	var dsrc := DemoObjects.tree()
 	vp.add_child(dsrc)
 	var dcard: OctaImpostor = OctaLOD.attach_card(dsrc, atlas, 1, OctaLOD.Mode.DUPLICATE, 0.0, OctaAtlas.Quality.HIGH, null, fs)
 	dcard.lod_distance = 40.0
-	_check(dcard.visibility_range_fade_mode == (GeometryInstance3D.VISIBILITY_RANGE_FADE_SELF if OctaLOD.fade_supported() else GeometryInstance3D.VISIBILITY_RANGE_FADE_DISABLED), "DUPLICATE card can fade in once it has a LOD distance")
+	_check(dcard.visibility_range_fade_mode == GeometryInstance3D.VISIBILITY_RANGE_FADE_SELF, "DUPLICATE card can fade in once it has a LOD distance")
 	var rsrc := DemoObjects.tree()
 	vp.add_child(rsrc)
 	var rcard: OctaImpostor = OctaLOD.attach_card(rsrc, atlas, 1, OctaLOD.Mode.REPLACE, 40.0, OctaAtlas.Quality.HIGH, null, fs)

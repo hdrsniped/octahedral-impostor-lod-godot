@@ -4,9 +4,10 @@ const USAGE := "Usage: godot --path <project> -s res://addons/octahedral_imposto
 const OWN_FLAGS := {
 	"scene": "=<res://x.tscn>  scene to load (required)",
 	"nodes": "=<a,b>  nodes to bake, by path or name (default: everything small on screen, as Bake Scene pre-ticks)",
-	"preset": "=<mobile|balanced|high_quality|complex_shapes>  applied first; the options below override it",
+	"preset": "=<minimal|fast|quality|max>  applied first; the options below override it",
 	"save-scene": "  write the cards back into the scene file",
-	"ignore-groups": "  treat OctaImpostorGroup nodes as plain nodes (default: each group is baked with its own settings)",
+	"pack": "  pack the atlases of this run into shared atlases, saved as <out>/<scene>_packed.res (with --save-scene the cards use them)",
+	"ignore-groups": "  treat OctaImpostorGroup nodes as plain nodes (default: each group is baked with its own settings; a group with a Chunk LOD distance also gets its chunk card)",
 	"help": "  print this list and exit",
 }
 const ALIASES := {"out": "output_dir", "atlas-size": "max_atlas_size"}
@@ -201,6 +202,10 @@ func _run() -> void:
 			return
 		cards += done
 		atlases.append(job.atlas)
+		if job.get("chunk_atlas") != null:
+			atlases.append(job.chunk_atlas)
+	if _args.has("pack") and not _pack(scene, scene_path, atlases, s):
+		return
 	var saved := ""
 	if _args.has("save-scene"):
 		var ps := PackedScene.new()
@@ -225,6 +230,56 @@ func _named(scene: Node, node: Node) -> bool:
 		if found == node:
 			return true
 	return false
+
+
+# --- Pack ---
+func _pack(scene: Node, scene_path: String, atlases: Array[OctaAtlas], s: OctaBakeSettings) -> bool:
+	var sources: Array = []
+	for a in atlases:
+		if a != null and not sources.has(a):
+			sources.append(a)
+	if sources.is_empty():
+		_fail("nothing was baked, so there is nothing to pack.")
+		return false
+	var limit := 4096
+	for a: OctaAtlas in sources:
+		limit = maxi(limit, maxi(a.albedo.get_width(), a.albedo.get_height()))
+	var map := {}
+	var packed := OctaPacker.pack(sources, limit, map)
+	var dir: String = _args.out if _args.has("out") else s.output_dir
+	var folder := dir if dir != "" else "res://"
+	if not folder.ends_with("/"):
+		folder += "/"
+	var base := scene_path.get_file().get_basename().to_snake_case() + "_packed"
+	var unique := base
+	var suffix := 2
+	while FileAccess.file_exists(folder + unique + ".res"):
+		unique = "%s_%d" % [base, suffix]
+		suffix += 1
+	var paths := OctaPacker.save_packed(packed, dir, unique)
+	if paths.is_empty():
+		_fail("could not save the packed atlases.")
+		return false
+	_repoint(scene, map)
+	print("octa_bake_cli: packed %d atlas(es) into %d shared atlas(es): %s" % [sources.size(), packed.size(), ", ".join(paths)])
+	return true
+
+
+func _repoint(node: Node, map: Dictionary) -> void:
+	if node is OctaImpostor and node.atlas != null and map.has(node.atlas):
+		var slot: Array = map[node.atlas].get(node.object_index, [])
+		if not slot.is_empty():
+			node.atlas = slot[0]
+			node.object_index = slot[1]
+	elif node is OctaImpostorGroup:
+		for prop: String in ["atlas", "chunk_atlas"]:
+			var a: OctaAtlas = node.get(prop)
+			if a != null and map.has(a):
+				var slot: Array = map[a].get(0, [])
+				if not slot.is_empty():
+					node.set(prop, slot[0])
+	for c in node.get_children():
+		_repoint(c, map)
 
 
 func _bake_job(scene: Node, scene_path: String, job: Dictionary) -> int:
@@ -278,9 +333,10 @@ func _bake_job(scene: Node, scene_path: String, job: Dictionary) -> int:
 	for k in targets.size():
 		var src := targets[k]
 		var kept := {}
+		var own := OctaLOD.find_cards(src)
+		if not own.is_empty():
+			kept = OctaLOD.card_overrides(own[0])
 		for below in [src] + OctaLOD.geometry_below(src):
-			for old in OctaLOD.find_cards(below):
-				kept = OctaLOD.card_overrides(old)
 			OctaLOD.remove_cards(below)
 		var card := OctaLOD.attach_card(src, atlas, index[k], s.mode, s.lod_distance, kept.get("quality", s.quality), scene, s)
 		OctaLOD.apply_overrides(card, kept)
@@ -291,6 +347,20 @@ func _bake_job(scene: Node, scene_path: String, job: Dictionary) -> int:
 			src.free()
 	if job.group != null:
 		job.group.atlas = atlas
+		if job.group.chunk_lod_distance > 0.0:
+			var chunk_settings: OctaBakeSettings = job.group.chunk_settings()
+			var chunk_path := "%s_chunk.res" % path.get_basename()
+			var cj := 2
+			while FileAccess.file_exists(chunk_path):
+				chunk_path = "%s_chunk_%d.res" % [path.get_basename(), cj]
+				cj += 1
+			var chunk_atlas := await OctaBaker.bake_to_file([job.group], root, chunk_path, chunk_settings)
+			if chunk_atlas == null:
+				_fail("chunk card bake failed.")
+				return -1
+			job.group.attach_chunk(chunk_atlas, chunk_settings, job.group.chunk_lod_distance)
+			job.chunk_atlas = chunk_atlas
+			print("octa_bake_cli: chunk card from %s beyond %.0f m" % [chunk_atlas.resource_path, job.group.chunk_lod_distance])
 	job.atlas = atlas
 	print("octa_bake_cli: baked %s - %d card(s), %d atlas entr%s, grid %d, %s" % [job.label, cards, atlas.object_count(), "y" if atlas.object_count() == 1 else "ies", atlas.grid_size, atlas.resource_path])
 	return cards

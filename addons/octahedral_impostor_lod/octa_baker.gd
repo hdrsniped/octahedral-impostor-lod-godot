@@ -43,9 +43,11 @@ static func bake(sources: Array, host: Node, settings: OctaBakeSettings = null, 
 			return null
 		entries.append(e)
 
-	var want_orm := settings.material_maps and _needs_material_map(entries)
+	var hooks := _any_hook(entries)
+	var want_orm := settings.material_maps and (_needs_material_map(entries) or hooks)
 	var want_em := false
 	if settings.emission:
+		want_em = hooks
 		for e in entries:
 			want_em = want_em or e.emit_scale > 0.0
 	var count := entries.size()
@@ -64,6 +66,9 @@ static func bake(sources: Array, host: Node, settings: OctaBakeSettings = null, 
 	atlas.bake_settings = settings.duplicate()
 	atlas.write_depth = settings.write_depth
 	atlas.precise_search = settings.precise_search
+	atlas.view_visibility = settings.view_visibility
+	atlas.pyramid_search = settings.coverage_pyramid
+	atlas.parallax_refine = settings.parallax_refine
 	atlas.shadow_views = settings.shadow_views
 	atlas.grid_size = n
 	atlas.hemisphere = settings.hemisphere
@@ -73,7 +78,7 @@ static func bake(sources: Array, host: Node, settings: OctaBakeSettings = null, 
 	atlas.frame_scale = frame_scale
 	var img_a := Image.create_empty(l.cols * n * fr, l.rows * n * fr, false, Image.FORMAT_RGBA8)
 	var img_n := Image.create_empty(l.cols * n * fr, l.rows * n * fr, false, Image.FORMAT_RGBA8)
-	var img_b: Image = Image.create_empty(l.cols * n * fr, l.rows * n * fr, false, Image.FORMAT_RGBA8) if settings.back_layer else null
+	var img_b: Image = Image.create_empty(l.cols * n * fr, l.rows * n * fr, false, Image.FORMAT_R8) if settings.back_layer else null
 	var img_o: Image = Image.create_empty(l.cols * n * fm, l.rows * n * fm, false, Image.FORMAT_RGBA8) if want_orm else null
 	var img_e: Image = Image.create_empty(l.cols * n * fm, l.rows * n * fm, false, Image.FORMAT_RGBA8) if want_em else null
 
@@ -172,7 +177,7 @@ static func bake(sources: Array, host: Node, settings: OctaBakeSettings = null, 
 				_blit(vps_a[j], img_a, fr, at)
 				_blit(vps_n[j], img_n, fr, at)
 				if img_b != null:
-					_blit(vps_b[j], img_b, fr, at)
+					_blit(vps_b[j], img_b, fr, at, Image.FORMAT_R8)
 				var at_m := (tile * n + Vector2i((f + j) % n, (f + j) / n)) * fm
 				if img_o != null:
 					_blit(vps_o[j], img_o, fm, at_m)
@@ -185,6 +190,8 @@ static func bake(sources: Array, host: Node, settings: OctaBakeSettings = null, 
 	OS.low_processor_usage_mode = low_cpu
 
 	await _mips(img_a, job)
+	if settings.coverage_pyramid:
+		atlas.max_coverage = _max_coverage_texture(img_n)
 	await _mips(img_n, job)
 	atlas.albedo = ImageTexture.create_from_image(img_a)
 	await _tick(job, false)
@@ -199,7 +206,6 @@ static func bake(sources: Array, host: Node, settings: OctaBakeSettings = null, 
 		atlas.emission = ImageTexture.create_from_image(img_e)
 		await _tick(job, false)
 	if img_b != null:
-		img_b.convert(Image.FORMAT_R8)
 		await _mips(img_b, job)
 		atlas.back_depth = ImageTexture.create_from_image(img_b)
 		await _tick(job, false)
@@ -243,6 +249,32 @@ static func _mips(img: Image, job: OctaBakeJob) -> void:
 		img.generate_mipmaps()
 
 
+static func _max_coverage_texture(src: Image) -> ImageTexture:
+	var w := src.get_width()
+	var h := src.get_height()
+	var cw := maxi(w / OctaAtlas.COVERAGE_BLOCK, 1)
+	var ch := maxi(h / OctaAtlas.COVERAGE_BLOCK, 1)
+	var s := src.get_data()
+	var d := PackedByteArray()
+	d.resize(cw * ch)
+	var stride := w * 4
+	for by in ch:
+		var top := by * OctaAtlas.COVERAGE_BLOCK * stride
+		for bx in cw:
+			var col := bx * OctaAtlas.COVERAGE_BLOCK * 4 + 3
+			var m := 0
+			for y in OctaAtlas.COVERAGE_BLOCK:
+				var i := top + y * stride + col
+				for x in OctaAtlas.COVERAGE_BLOCK:
+					var a: int = s[i]
+					if a > m:
+						m = a
+					i += 4
+			d[by * cw + bx] = m
+	var img := Image.create_from_data(cw, ch, false, Image.FORMAT_R8, d)
+	return ImageTexture.create_from_image(img)
+
+
 # --- Save ---
 static func bake_to_file(sources: Array, host: Node, path: String, settings: OctaBakeSettings = null, job: OctaBakeJob = null) -> OctaAtlas:
 	if settings == null:
@@ -268,6 +300,7 @@ static func save_atlas(atlas: OctaAtlas, path: String, settings: OctaBakeSetting
 		atlas.orm = _compress(atlas.orm, mode)
 	if atlas.emission != null:
 		atlas.emission = _compress(atlas.emission, mode)
+	atlas.refresh_materials()
 	for q in OctaAtlas.Quality.size():
 		atlas.get_material(q)
 	atlas.get_material(OctaAtlas.Quality.HIGH)
@@ -287,9 +320,9 @@ static func _compress(tex: Texture2D, mode: PortableCompressedTexture2D.Compress
 	return t
 
 
-static func _blit(vp: SubViewport, into: Image, size: int, at: Vector2i) -> void:
+static func _blit(vp: SubViewport, into: Image, size: int, at: Vector2i, fmt := Image.FORMAT_RGBA8) -> void:
 	var img := vp.get_texture().get_image()
-	img.convert(Image.FORMAT_RGBA8)
+	img.convert(fmt)
 	into.blit_rect(img, Rect2i(0, 0, size, size), at)
 
 
@@ -446,7 +479,7 @@ static func _make_viewport(parent: Node, size: int, world: World3D, data_pass: b
 	vp.mesh_lod_threshold = 0.0
 	vp.positional_shadow_atlas_size = 0
 	vp.scaling_3d_scale = 1.0
-	vp.debug_draw = Viewport.DEBUG_DRAW_DISABLED if data_pass else Viewport.DEBUG_DRAW_UNSHADED
+	vp.debug_draw = Viewport.DEBUG_DRAW_UNSHADED
 	vp.use_hdr_2d = data_pass
 	vp.render_target_update_mode = SubViewport.UPDATE_ONCE
 	var cam := Camera3D.new()
@@ -482,9 +515,9 @@ static func _fill_holders(e: Dictionary, holder_a: Node, holder_n: Node, holder_
 					back_mats[m] = _capture_material(m, true)
 					e.capture_mats.append(back_mats[m])
 				if holder_o != null:
-					orm_mats[m] = _orm_material(m)
+					orm_mats[m] = _orm_material_for(m)
 				if holder_e != null:
-					em_mats[m] = _emission_material(m, e.emit_scale)
+					em_mats[m] = _emission_material_for(m, e.emit_scale)
 			a.set_surface_override_material(s, albedo_mats[m])
 			d.set_surface_override_material(s, data_mats[m])
 		holder_a.add_child(a)
@@ -604,3 +637,39 @@ static func _emission_material(m: Material, scale: float) -> ShaderMaterial:
 	else:
 		sm.set_shader_parameter("emission_mul", 0.0)
 	return sm
+
+
+# --- Bake hook ---
+static func _any_hook(entries: Array[Dictionary]) -> bool:
+	for e in entries:
+		for p in e.parts:
+			for m in p.mats:
+				if _has_bake_hook(m):
+					return true
+	return false
+
+
+static func _has_bake_hook(m: Material) -> bool:
+	if not m is ShaderMaterial:
+		return false
+	var sh: Shader = (m as ShaderMaterial).shader
+	if sh == null:
+		return false
+	return sh.code.contains("octa_bake_mode") or sh.code.contains("octa_bake_hook")
+
+
+static func _orm_material_for(m: Material) -> Material:
+	if _has_bake_hook(m):
+		var d: ShaderMaterial = m.duplicate()
+		d.set_shader_parameter("octa_bake_mode", 1)
+		return d
+	return _orm_material(m)
+
+
+static func _emission_material_for(m: Material, scale: float) -> Material:
+	if _has_bake_hook(m):
+		var d: ShaderMaterial = m.duplicate()
+		d.set_shader_parameter("octa_bake_mode", 2)
+		d.set_shader_parameter("octa_bake_scale", scale)
+		return d
+	return _emission_material(m, scale)

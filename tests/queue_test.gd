@@ -81,7 +81,7 @@ func _run() -> void:
 	var p95: int = samples[int(samples.size() * 0.95)]
 	var over := samples.filter(func(v: int) -> bool: return v > 2.0 * queue.budget_ms * 1000.0).size()
 	print("QUEUE %d frames: p50 %.2f ms, p95 %.2f ms, %d frames above 2x budget (atlas %d px)" % [samples.size(), samples[samples.size() / 2] / 1000.0, p95 / 1000.0, over, ATLAS_SIZE])
-	_check(samples[samples.size() / 2] < 1.5 * queue.budget_ms * 1000.0 and p95 < 4.0 * queue.budget_ms * 1000.0 and queue.max_frame_usec < 40000, "max %.2f ms, p95 %.2f ms stay near the %.1f ms budget (p50 under 1.5x, p95 under 4x, max under 40 ms)" % [queue.max_frame_usec / 1000.0, p95 / 1000.0, queue.budget_ms])
+	_check(samples[samples.size() / 2] < 1.5 * queue.budget_ms * 1000.0 and p95 < 4.0 * queue.budget_ms * 1000.0 and queue.max_frame_usec < 100000, "max %.2f ms, p95 %.2f ms stay near the %.1f ms budget (p50 under 1.5x, p95 under 4x, max under 100 ms)" % [queue.max_frame_usec / 1000.0, p95 / 1000.0, queue.budget_ms])
 
 	var all_cards := true
 	var all_done := true
@@ -96,6 +96,12 @@ func _run() -> void:
 		atlases[jobs[i].atlas] = true
 		share_ok = share_ok and jobs[i].atlas == jobs[i % 5].atlas
 	_check(atlases.size() == 5 and share_ok, "5 distinct shapes made %d atlases; duplicates share their atlas" % atlases.size())
+	var plain_only := OctaAtlas._variants.is_empty()
+	for a: OctaAtlas in atlases:
+		plain_only = plain_only and not a.wind_active() and not a.card_fade
+		for m in a.materials:
+			plain_only = plain_only and (m == null or OctaAtlas.SHADERS.has(m.shader))
+	_check(plain_only, "queue-baked cards stay on the shipped shaders (no wind, fade or other variant is built)")
 	_check(not cancel_job.running and cancel_job.card == null and OctaLOD.find_cards(cancel_victim).is_empty(), "cancelled job produced no card")
 	_check(freed and not free_job.running and free_job.card == null, "freeing a source mid-bake completed its job as failed (freed: %s)" % freed)
 

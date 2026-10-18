@@ -30,12 +30,27 @@ const float COARSE_LOD_SCALE = 8.0;
 const float MIN_CAMERA_GAP = 0.02;
 const float SPHERE_EDGE = 1.001;
 const float POLE_DOT = 0.999;
-#if QUALITY >= 2
+#if QUALITY >= 2 || defined(PARALLAX_REFINE)
 #define PARALLAX_STEPS 3
 #else
 #define PARALLAX_STEPS 1
 #endif
 #define SHADOW_STEPS 2
+#ifdef CARD_FADE
+const vec3 FADE_NOISE = vec3(0.06711056, 0.00583715, 52.9829189);
+const float FADE_CAP = 0.001;
+#endif
+#ifdef VIEW_VISIBILITY
+const float VIS_TOLERANCE = 0.5;
+#endif
+#ifdef CARD_WIND
+const float WIND_SWAY = 0.2;
+const float WIND_LIMIT = 0.5;
+const float TAU_F = 6.2831853;
+#define WIND_SHIFT + wind_w
+#else
+#define WIND_SHIFT
+#endif
 #if QUALITY == 3 && defined(PRECISE_SEARCH)
 #define SEARCH_SUB 4
 const float PROBE_MIN = 0.05;
@@ -59,6 +74,10 @@ uniform float frame_scale = 1.0;
 uniform sampler2D back_atlas : filter_linear_mipmap, repeat_disable;
 uniform bool use_back_layer = false;
 #endif
+#if QUALITY == 3 && defined(PYRAMID_SEARCH)
+uniform sampler2D max_coverage : filter_nearest, repeat_disable;
+const float PYR_SKIP = 0.02;
+#endif
 
 group_uniforms look;
 uniform vec4 tint : source_color = vec4(1.0);
@@ -76,10 +95,26 @@ uniform float layer_tolerance : hint_range(0.0, 1.0) = 0.15;
 uniform float min_thickness : hint_range(0.0, 1.0) = 0.1;
 #endif
 group_uniforms;
+#ifdef CARD_WIND
+group_uniforms wind;
+uniform vec2 wind_dir = vec2(1.0, 0.0);
+uniform float wind_speed : hint_range(0.0, 100.0) = 4.0;
+uniform float wind_frequency : hint_range(0.001, 1.0) = 0.05;
+uniform float wind_gust : hint_range(0.0, 1.0) = 0.3;
+group_uniforms;
+#endif
 
 instance uniform int octa_index = 0;
 instance uniform vec4 card_tint : source_color = vec4(1.0);
 instance uniform float card_depth = 1.0;
+#ifdef CARD_FADE
+instance uniform vec2 card_fade = vec2(0.0);
+varying flat float v_fade;
+#endif
+#ifdef CARD_WIND
+instance uniform float card_wind = 0.0;
+varying flat vec3 v_wind;
+#endif
 
 varying vec3 v_ray;
 varying vec3 v_pos;
@@ -216,6 +251,31 @@ void vertex() {
 	bool joined = INSTANCE_CUSTOM.a > 0.0;
 	v_tint = tint.rgb * (joined ? INSTANCE_CUSTOM.rgb : card_tint.rgb);
 	v_depth = depth_scale * (joined ? INSTANCE_CUSTOM.a : card_depth);
+#ifdef CARD_WIND
+	v_wind = vec3(0.0);
+	if (card_wind > 0.0) {
+		vec2 wp = (MODEL_MATRIX * vec4(b.xyz, 1.0)).xz;
+		vec2 side_dir = vec2(-wind_dir.y, wind_dir.x);
+		float k = wind_frequency * TAU_F;
+		float clock = TIME * wind_speed * k;
+		float along = dot(wp, wind_dir) * k;
+		float across = dot(wp, side_dir) * k;
+		float swell = 0.6 * sin(along - clock) + 0.4 * sin(across * 1.19 + along * 0.6 - clock * 1.3 + 1.7);
+		float gust = wind_gust * max(sin(along * 0.35 - clock * 0.4 + across * 0.2), 0.0);
+		float flutter = 0.25 * sin(along * 2.3 - clock * 2.1 + across);
+		vec2 w2 = wind_dir * (0.6 + 0.4 * swell + gust) + side_dir * flutter;
+		vec3 wl = mat3(inv_model) * vec3(w2.x, 0.0, w2.y) * length(MODEL_MATRIX[1].xyz);
+		v_wind = wl * (card_wind * WIND_SWAY);
+		float wl_len = length(v_wind);
+		if (wl_len > WIND_LIMIT) {
+			v_wind *= WIND_LIMIT / wl_len;
+		}
+	}
+#endif
+#ifdef CARD_FADE
+	float fade_dist = length((VIEW_MATRIX * (MODEL_MATRIX * vec4(b.xyz, 1.0))).xyz);
+	v_fade = card_fade.y <= 0.0 ? 1.0 : (card_fade.y > card_fade.x ? smoothstep(card_fade.x, card_fade.y, fade_dist) : step(card_fade.y, fade_dist));
+#endif
 }
 
 // --- Fragment helpers ---
@@ -228,25 +288,12 @@ bool in_frame(vec2 u) {
 	return all(greaterThanEqual(u, vec2(0.0))) && all(lessThanEqual(u, vec2(1.0)));
 }
 
-bool is_inside(vec3 p, vec3 d, vec2 u, vec4 nd, float back, bool front_only) {
-	if (!in_frame(u) || nd.a < PIXEL_SOLID) {
-		return false;
-	}
-	float hf = (1.0 - 2.0 * nd.b / nd.a) * v_depth;
-	float hb = -2.0;
-	if (use_back_layer && !front_only) {
-		hb = min((1.0 - 2.0 * back / nd.a) * v_depth, hf - min_thickness);
-	}
+bool is_inside(vec3 p, vec3 d, float hf, float hb) {
 	float ph = dot(p, d);
 	return ph <= hf && ph >= hb;
 }
 
-bool crossed_slab(vec3 p, vec3 p_prev, vec3 d, vec2 u, vec4 nd, float back) {
-	if (!use_back_layer || !in_frame(u) || nd.a < PIXEL_SOLID) {
-		return false;
-	}
-	float hf = (1.0 - 2.0 * nd.b / nd.a) * v_depth;
-	float hb = min((1.0 - 2.0 * back / nd.a) * v_depth, hf - min_thickness);
+bool crossed_slab(vec3 p, vec3 p_prev, vec3 d, float hf, float hb) {
 	return dot(p_prev, d) > hf && dot(p, d) < hb;
 }
 #endif
@@ -267,8 +314,25 @@ float shadow_view(vec2 frame, vec3 d, vec3 bx, vec3 by, vec3 ro, vec3 rd, vec2 g
 
 // --- Fragment: blend views, parallax, per-pixel depth ---
 void fragment() {
+#ifdef CARD_FADE
+	if (!IN_SHADOW_PASS && v_fade < 1.0) {
+		float gap = 1.0 - v_fade;
+		float noise = fract(FADE_NOISE.z * fract(dot(FRAGCOORD.xy, FADE_NOISE.xy)));
+		if (gap >= FADE_CAP && noise <= gap) {
+			discard;
+		}
+	}
+#endif
 	vec3 rd = normalize(v_ray);
 	vec3 ro = v_pos;
+#ifdef CARD_WIND
+	vec3 wind_w = vec3(0.0);
+	if (dot(v_wind, v_wind) > 0.0) {
+		float lift = clamp((ro - rd * dot(ro, rd)).y * 0.5 + 0.5, 0.0, 1.0);
+		wind_w = v_wind * (lift * lift);
+		ro -= wind_w;
+	}
+#endif
 	vec2 fr[3] = vec2[3](v_f01.xy, v_f01.zw, v_f2);
 	float wt[3] = float[3](v_w.x, v_w.y, v_w.z);
 	if (IN_SHADOW_PASS) {
@@ -303,7 +367,7 @@ void fragment() {
 		if (cov_sum < max(alpha_cut, 1e-4)) {
 			discard;
 		}
-		vec3 ps = pos_sum + rd * shadow_bias;
+		vec3 ps = pos_sum WIND_SHIFT + rd * shadow_bias;
 #ifndef NO_DEPTH_WRITE
 		vec4 sclip = PROJECTION_MATRIX * (VIEW_MATRIX * (MODEL_MATRIX * vec4(v_bounds.xyz + ps * v_bounds.w, 1.0)));
 #if CURRENT_RENDERER == RENDERER_COMPATIBILITY
@@ -399,8 +463,18 @@ void fragment() {
 					vec2 a = atlas_uv(fr[i], u);
 					vec4 n4 = textureGrad(normal_atlas, a, gx, gy);
 					float bk = use_back_layer ? textureGrad(back_atlas, a, gx, gy).r : 0.0;
-					bool crossed = s > 0 && crossed_slab(p, p - rd * sub, fd[i], u, n4, bk);
-					if (crossed || is_inside(p, fd[i], u, n4, bk, false)) {
+					bool in_fr = in_frame(u);
+					bool solid = n4.a >= PIXEL_SOLID;
+					float hf = 0.0;
+					float hb = -2.0;
+					if (in_fr && solid) {
+						hf = baked_height(n4);
+						if (use_back_layer) {
+							hb = min((1.0 - 2.0 * bk / n4.a) * v_depth, hf - min_thickness);
+						}
+					}
+					bool crossed = s > 0 && in_fr && solid && use_back_layer && crossed_slab(p, p - rd * sub, fd[i], hf, hb);
+					if (crossed || (in_fr && solid && is_inside(p, fd[i], hf, hb))) {
 						front_only = crossed;
 						hit[i] = 1.0;
 						lo = s == 0 ? t : t - sub;
@@ -420,10 +494,29 @@ void fragment() {
 				vec3 p = ro + rd * t;
 				vec2 u = frame_uv(p, fx[i], fy[i]);
 				vec2 a = atlas_uv(fr[i], u);
+#if defined(PYRAMID_SEARCH)
+				if (s > 0) {
+					vec2 up = frame_uv(ro + rd * (t_in + dt * float(s - 1)), fx[i], fy[i]);
+					if (texture(max_coverage, atlas_uv(fr[i], (up + u) * 0.5)).r < PYR_SKIP) {
+						lo = t;
+						continue;
+					}
+				}
+#endif
 				vec4 n4 = textureGrad(normal_atlas, a, gx, gy);
 				float bk = use_back_layer ? textureGrad(back_atlas, a, gx, gy).r : 0.0;
-				bool crossed = s > 0 && crossed_slab(p, p - rd * dt, fd[i], u, n4, bk);
-				if (crossed || is_inside(p, fd[i], u, n4, bk, false)) {
+				bool in_fr = in_frame(u);
+				bool solid = n4.a >= PIXEL_SOLID;
+				float hf = 0.0;
+				float hb = -2.0;
+				if (in_fr && solid) {
+					hf = baked_height(n4);
+					if (use_back_layer) {
+						hb = min((1.0 - 2.0 * bk / n4.a) * v_depth, hf - min_thickness);
+					}
+				}
+				bool crossed = s > 0 && in_fr && solid && use_back_layer && crossed_slab(p, p - rd * dt, fd[i], hf, hb);
+				if (crossed || (in_fr && solid && is_inside(p, fd[i], hf, hb))) {
 					front_only = crossed;
 					hit[i] = 1.0;
 					hi = t;
@@ -444,7 +537,17 @@ void fragment() {
 				vec2 a = atlas_uv(fr[i], u);
 				vec4 n4 = textureGrad(normal_atlas, a, gx, gy);
 				float bk = use_back_layer ? textureGrad(back_atlas, a, gx, gy).r : 0.0;
-				if (is_inside(p, fd[i], u, n4, bk, front_only)) {
+				bool in_fr = in_frame(u);
+				bool solid = n4.a >= PIXEL_SOLID;
+				float hf = 0.0;
+				float hb = -2.0;
+				if (in_fr && solid) {
+					hf = baked_height(n4);
+					if (use_back_layer && !front_only) {
+						hb = min((1.0 - 2.0 * bk / n4.a) * v_depth, hf - min_thickness);
+					}
+				}
+				if (in_fr && solid && is_inside(p, fd[i], hf, hb)) {
 					hi = t;
 					nh[i] = n4;
 					uh[i] = u;
@@ -485,8 +588,16 @@ void fragment() {
 			WASTE_PIXEL
 		}
 #else
+		float ti[3];
+		float wv[3];
+		vec4 nv[3];
+		vec2 uv2[3];
 		for (int i = 0; i < NUM_FRAMES; i++) {
-			if (wt[i] <= WEIGHT_MIN) {
+			ti[i] = -1e9;
+			wv[i] = 0.0;
+			nv[i] = vec4(0.0);
+			uv2[i] = uv[i];
+			if (wt[i] <= WEIGHT_MIN || nd[i].a <= COARSE_MIN) {
 				continue;
 			}
 			vec2 u = uv[i];
@@ -495,18 +606,38 @@ void fragment() {
 				u = frame_uv(ro + rd * ((baked_height(n4) - rod[i]) / denom[i]), fx[i], fy[i]);
 				n4 = textureGrad(normal_atlas, atlas_uv(fr[i], u), gx, gy);
 			}
-			float w = wt[i] * float(all(greaterThanEqual(u, vec2(0.0))) && all(lessThanEqual(u, vec2(1.0))));
-			float cov = n4.a * w;
+			ti[i] = (baked_height(n4) - rod[i]) / denom[i];
+			wv[i] = wt[i] * float(all(greaterThanEqual(u, vec2(0.0))) && all(lessThanEqual(u, vec2(1.0))));
+			nv[i] = n4;
+			uv2[i] = u;
+		}
+		float t_ref = 1e9;
+		for (int i = 0; i < NUM_FRAMES; i++) {
+			if (wv[i] > 0.0 && nv[i].a > PIXEL_VALID) {
+				t_ref = min(t_ref, ti[i]);
+			}
+		}
+		for (int i = 0; i < NUM_FRAMES; i++) {
+			if (wv[i] <= 0.0) {
+				continue;
+			}
+			float w = wv[i];
+#ifdef VIEW_VISIBILITY
+			if (nv[i].a > PIXEL_VALID && t_ref < 1e8) {
+				w *= 1.0 - smoothstep(VIS_TOLERANCE * 0.5, VIS_TOLERANCE, max(ti[i] - t_ref, 0.0));
+			}
+#endif
+			float cov = nv[i].a * w;
 			acc_cov += cov;
-			acc_p += (ro + rd * ((baked_height(n4) - rod[i]) / denom[i])) * cov;
-			acc_a += textureGrad(albedo_atlas, atlas_uv(fr[i], u), gx, gy) * w;
+			acc_p += (ro + rd * ti[i]) * cov;
+			acc_a += textureGrad(albedo_atlas, atlas_uv(fr[i], uv2[i]), gx, gy) * w;
 			if (use_orm) {
-				acc_o += textureGrad(orm_atlas, atlas_uv(fr[i], u), gx, gy) * w;
+				acc_o += textureGrad(orm_atlas, atlas_uv(fr[i], uv2[i]), gx, gy) * w;
 			}
 			if (use_emission) {
-				acc_e += textureGrad(emission_atlas, atlas_uv(fr[i], u), gx, gy) * w;
+				acc_e += textureGrad(emission_atlas, atlas_uv(fr[i], uv2[i]), gx, gy) * w;
 			}
-			vec2 nxy = n4.a > 0.0 ? n4.xy / n4.a * 2.0 - 1.0 : vec2(0.0);
+			vec2 nxy = nv[i].a > 0.0 ? nv[i].xy / nv[i].a * 2.0 - 1.0 : vec2(0.0);
 			acc_n += (fx[i] * nxy.x + fy[i] * nxy.y + fd[i] * sqrt(max(1.0 - dot(nxy, nxy), 0.0))) * cov;
 		}
 		if (acc_cov < max(alpha_cut, 1e-4)) {
@@ -514,6 +645,10 @@ void fragment() {
 		}
 #endif
 		ALBEDO = acc_a.rgb / max(acc_a.a, 1e-4) * v_tint;
+#ifdef CARD_WIND
+		vec3 lean = normalize(acc_n);
+		acc_n = lean + cross(cross(vec3(0.0, 1.0, 0.0), v_wind), lean);
+#endif
 		vec3 n_view = normalize(mat3(VIEW_MATRIX) * normalize(v_nmat * acc_n));
 		NORMAL = normalize(mix(NORMAL, n_view, normal_strength));
 		ROUGHNESS = v_surf.x;
@@ -531,7 +666,7 @@ void fragment() {
 		if (use_emission) {
 			EMISSION = acc_e.rgb / max(acc_e.a, 1e-4) * v_mat.x;
 		}
-		vec3 p_l = acc_p / acc_cov;
+		vec3 p_l = acc_p / acc_cov WIND_SHIFT;
 		vec3 p_obj = v_bounds.xyz + p_l * v_bounds.w;
 		vec4 p_view = VIEW_MATRIX * (MODEL_MATRIX * vec4(p_obj, 1.0));
 #ifndef NO_DEPTH_WRITE

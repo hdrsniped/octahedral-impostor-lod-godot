@@ -13,7 +13,12 @@ func _run() -> void:
 	var shadow_only: bool = false
 	var shadow_views: int = 1
 	var precise: bool = false
+	var pyramid: bool = false
+	var parallax: bool = false
 	var extent: float = 300.0
+	var fade: int = 0
+	var wind: float = 0.0
+	var depth: bool = true
 	var args: PackedStringArray = OS.get_cmdline_user_args()
 	for arg: String in args:
 		if arg.begins_with("--count="):
@@ -28,8 +33,18 @@ func _run() -> void:
 			shadow_only = arg.trim_prefix("--shadow_only=") == "1"
 		elif arg.begins_with("--precise="):
 			precise = arg.trim_prefix("--precise=") == "1"
+		elif arg.begins_with("--pyramid="):
+			pyramid = arg.trim_prefix("--pyramid=") == "1"
+		elif arg.begins_with("--parallax="):
+			parallax = arg.trim_prefix("--parallax=") == "1"
+		elif arg.begins_with("--wind="):
+			wind = float(arg.trim_prefix("--wind="))
+		elif arg.begins_with("--fade="):
+			fade = int(arg.trim_prefix("--fade="))
 		elif arg.begins_with("--extent="):
 			extent = float(arg.trim_prefix("--extent="))
+		elif arg.begins_with("--depth="):
+			depth = arg.trim_prefix("--depth=") == "1"
 
 	if "--uncapped" in args:
 		DisplayServer.window_set_vsync_mode(DisplayServer.VSYNC_DISABLED)
@@ -100,8 +115,14 @@ func _run() -> void:
 		var q: int = {"low": 0, "medium": 1, "high": 2, "ultra": 3}.get(mode, 2)
 		var atlas: OctaAtlas = await OctaBaker.bake([DemoObjects.rock(1)], root)
 		atlas.precise_search = precise
+		atlas.pyramid_search = pyramid
+		atlas.parallax_refine = parallax
+		atlas.write_depth = depth
 		atlas.get_material(q as OctaAtlas.Quality).set_shader_parameter("shadow_views", shadow_views)
-		var field: MultiMeshInstance3D = atlas.create_multimesh(0, transforms, q)
+		var field: MultiMeshInstance3D = atlas.create_multimesh(0, transforms, q, [], 5.0 if fade > 0 else 0.0, 2.0 if fade > 0 else 0.0, wind)
+		if fade == 2:
+			atlas.get_material(q as OctaAtlas.Quality).shader = OctaAtlas.shader_for(q, true, -1, false, true)
+			field.set_instance_shader_parameter("card_fade", OctaLOD.fade_band(5.0, 2.0))
 		if shadow_only:
 			field.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_SHADOWS_ONLY
 		root.add_child(field)
@@ -157,7 +178,10 @@ func _run() -> void:
 	if frame_ms_avg > 0.0:
 		fps = 1000.0 / frame_ms_avg
 
-	print("PERF mode=%s shadows=%s shadow_only=%s count=%d gpu_ms_avg=%.2f gpu_ms_p95=%.2f cpu_ms_avg=%.2f frame_ms_avg=%.2f fps=%.2f prims=%d draws=%d" % [
+	print("PERF wind=%.2f fade=%d depth=%s mode=%s shadows=%s shadow_only=%s count=%d gpu_ms_avg=%.2f gpu_ms_p95=%.2f cpu_ms_avg=%.2f frame_ms_avg=%.2f fps=%.2f prims=%d draws=%d" % [
+		wind,
+		fade,
+		depth,
 		mode,
 		shadows,
 		shadow_only,

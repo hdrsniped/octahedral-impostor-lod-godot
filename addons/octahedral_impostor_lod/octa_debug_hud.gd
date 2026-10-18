@@ -55,8 +55,7 @@ func scan() -> Dictionary:
 	var fill := {}
 	if tree != null and tree.root != null:
 		var cam := get_viewport().get_camera_3d() if is_inside_tree() else null
-		for n in tree.root.find_children("*", "OctaImpostor", true, false):
-			var c := n as OctaImpostor
+		for c in OctaImpostor.live_cards():
 			cards += 1
 			var dist := cam.global_position.distance_to(c.global_position) if cam != null else 0.0
 			var active := c.is_visible_in_tree() and dist >= c.visibility_range_begin and (c.visibility_range_end <= 0.0 or dist <= c.visibility_range_end)
@@ -65,15 +64,14 @@ func scan() -> Dictionary:
 				_add_fill(fill, c.atlas, c.object_index, c.global_position, c.global_transform.basis.get_scale().x, cam)
 			elif c.get_meta(OctaLOD.MODE_META, OctaLOD.Mode.DYNAMIC_LOD) == OctaLOD.Mode.DYNAMIC_LOD:
 				real += 1
-		for n in tree.root.find_children("*", "MultiMeshInstance3D", true, false):
-			var mmi := n as MultiMeshInstance3D
-			var m := mmi.material_override as ShaderMaterial
-			if m != null and m.get_shader_parameter("obj_data") != null and mmi.multimesh != null:
-				cards += 1
-				instances += mmi.multimesh.instance_count
-				if mmi.is_visible_in_tree():
-					impostors += mmi.multimesh.instance_count
-					_add_multimesh_fill(fill, mmi, m, cam)
+		for mmi in OctaJoinedGroup.live_groups():
+			if mmi.multimesh == null or mmi.atlas == null:
+				continue
+			cards += 1
+			instances += mmi.multimesh.instance_count
+			if mmi.is_visible_in_tree():
+				impostors += mmi.multimesh.instance_count
+				_add_multimesh_fill(fill, mmi, cam)
 	var atlases := OctaAtlas.live_atlases()
 	var bytes := 0
 	for a in atlases:
@@ -103,13 +101,9 @@ func _add_fill(fill: Dictionary, atlas: OctaAtlas, index: int, pos: Vector3, sca
 	fill[atlas] = w + Vector2(OctaCoverage.mean_covered(atlas, index) * screen, screen)
 
 
-func _add_multimesh_fill(fill: Dictionary, mmi: MultiMeshInstance3D, m: ShaderMaterial, cam: Camera3D) -> void:
-	var atlas: OctaAtlas = null
-	for a in OctaAtlas.live_atlases():
-		if a.object_data() == m.get_shader_parameter("obj_data"):
-			atlas = a
+func _add_multimesh_fill(fill: Dictionary, mmi: OctaJoinedGroup, cam: Camera3D) -> void:
 	var mm := mmi.multimesh
 	var index := int(mmi.get_instance_shader_parameter("octa_index"))
 	for i in mini(mm.instance_count, MAX_FILL_INSTANCES):
 		var t := mmi.global_transform * mm.get_instance_transform(i)
-		_add_fill(fill, atlas, index, t.origin, t.basis.get_scale().x, cam)
+		_add_fill(fill, mmi.atlas, index, t.origin, t.basis.get_scale().x, cam)

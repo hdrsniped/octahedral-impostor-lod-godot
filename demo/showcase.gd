@@ -9,8 +9,8 @@ const STATS_EMPTY := "Spawned Props: --\nFPS: --\nGPU Time: --\nCPU Time: --\nTr
 const SUMMARY := "Press [F] to Hot-Swap to %s  •  [B] Auto-Benchmark  •  [G] Wave Metric"
 const HELP := """[F] HOT-SWAP  •  [O] AUTO LOD  •  [J] JOIN  •  [B] AUTO-BENCHMARK  •  [G] WAVE  •  [A] ANALYTICS  •  [H] TOGGLE UI  •  [L] LEVEL
 [b]Props (%d):[/b] [+] / [-] (one at a time)  •  [b]Asset:[/b] [1] Rock [2] Tree [3] Rings [4] Textured  •  [b]Quality:[/b] [F1] Low [F2] Med [F3] High [F4] Ultra
-[b]Plugin:[/b] [D] Debug View  •  [P] Precise Search  •  [W] Write Depth  •  [S] Shadows  •  [V] Shadow Views  •  [R] Sun Spin  •  [T] Tint
-[b]Camera:[/b] [Space] Orbit | Drag | Wheel  •  [Esc] Exit"""
+[b]Plugin:[/b] [D] Debug View  •  [P] Precise Search  •  [W] Write Depth  •  [S] Shadows  •  [V] Shadow Views  •  [R] Sun Spin  •  [T] Tint  •  [K] Wind (Tree)  •  [C] Chunk LOD
+[b]Camera:[/b] [Space] Orbit | Drag | Wheel | [Arrows] Move | [Q]/[E] Down/Up | [Shift] Fast  •  [Esc] Exit"""
 const HEX_REAL := "#ff4444"
 const HEX_IMP := "#33b5ff"
 const HEX_GOOD := "#44ff66"
@@ -26,6 +26,7 @@ const MB := 1048576.0
 const VRAM_BUDGET_MB := 2048.0
 const MAX_PROPS := 4000
 const WAVE_POINTS := 75
+const FLY_SPEED := 9.0
 const WAVE_STEP := 0.04
 const HUD_STEP := 0.125
 const SCAN_STEP := 1.0
@@ -35,12 +36,18 @@ const SIDE_X := 2.2
 const LOD_DISTANCE := 14.0
 const LOD_FADE := 4.0
 const JOIN_CELL := 50.0
+const CHUNK_DISTANCE := 24.0
+const CHUNK_PROPS := 3
 const SUN_SPIN_DEG := 25.0
 const BENCH_STEP := 0.12
 const BENCH_GROW := 0.05
 const BENCH_STABLE := 5.0
 const BENCH_IMPOSTOR := 10.0
 const JOINED := &"demo_joined"
+const WIND_ASSET := 1
+const WIND_STRENGTH := 0.4
+const WIND_DIRECTION := Vector2(1.0, 0.4)
+const WIND_SPEED := 8.0
 
 var _atlas: OctaAtlas
 var _models: Array[Node3D] = []
@@ -60,6 +67,8 @@ var _analytics_visible: bool = true
 var _joined: bool = false
 var _auto_lod: bool = false
 var _sun_spin: bool = false
+var _wind: bool = false
+var _chunk_group: OctaImpostorGroup
 var _join_stats := Vector2i.ZERO
 var _join_base := Vector2(-1, -1)
 var _yaw: float = 0.0
@@ -429,6 +438,7 @@ func _run_loading_and_bake() -> void:
 	settings.hemisphere = true
 	settings.max_atlas_size = 4096
 	settings.msaa = Viewport.MSAA_4X
+	settings.batch_size = 8
 	settings.padding_px = 2
 	settings.quality = OctaAtlas.Quality.HIGH
 	var t0 := Time.get_ticks_msec()
@@ -483,6 +493,9 @@ func _live_imp() -> bool:
 
 
 func _rebuild() -> void:
+	if is_instance_valid(_chunk_group):
+		_chunk_group.queue_free()
+	_chunk_group = null
 	_clear(_field)
 	_clear(_join_node)
 	for s in _sides:
@@ -502,6 +515,7 @@ func _fill_slot(slot: Node3D) -> void:
 	slot.add_child(real)
 	var card := _atlas.create_card(_current_asset, _quality)
 	card.name = "ImpostorCard"
+	card.wind_strength = _wind_strength()
 	slot.add_child(card)
 	if _auto_lod:
 		_set_slot_lod(slot, true)
@@ -583,7 +597,7 @@ func _set_slot_lod(slot: Node, on: bool) -> void:
 	var card: OctaImpostor = slot.get_child(1)
 	card.lod_distance = LOD_DISTANCE if on else 0.0
 	card.fade_margin = LOD_FADE
-	card.fade = OctaLOD.Fade.CROSSFADE if on and OctaLOD.fade_supported() else OctaLOD.Fade.NONE
+	card.fade = OctaLOD.Fade.CROSSFADE if on else OctaLOD.Fade.NONE
 	for gi in OctaLOD.geometry_below(slot.get_child(0)):
 		gi.visibility_parent = gi.get_path_to(card) if on else NodePath()
 
@@ -618,29 +632,88 @@ func _set_joined(on: bool) -> void:
 
 func _rebuild_join() -> void:
 	_clear(_join_node)
-	var groups := {}
+	var slots: Array = []
+	var points := PackedVector3Array()
 	for s in _field.get_children():
 		s.get_child(1).set_meta(JOINED, false)
-		if _joined:
-			var cell := Vector3i((s.position / JOIN_CELL).floor())
-			if not groups.has(cell):
-				groups[cell] = []
-			groups[cell].append(s)
+		slots.append(s)
+		points.append(s.position)
 	_join_stats = Vector2i.ZERO
-	var custom := OctaAtlas.joined_custom(Color.WHITE, 1.0)
-	for g: Array in groups.values():
-		if g.size() < 2:
-			continue
-		var xforms: Array = []
-		for s: Node3D in g:
-			xforms.append(s.transform)
-			s.get_child(1).set_meta(JOINED, true)
-		var customs: Array = []
-		customs.resize(g.size())
-		customs.fill(custom)
-		_join_node.add_child(_atlas.create_multimesh(_current_asset, xforms, _quality, customs))
-		_join_stats += Vector2i(1, g.size())
+	if _joined:
+		var custom := OctaAtlas.joined_custom(Color.WHITE, 1.0)
+		var rules := OctaBakeSettings.new()
+		for region: PackedInt32Array in OctaJoin.partition(points, JOIN_CELL, rules.join_adaptive, rules.join_region_size, rules.join_region_count):
+			if region.size() < 2:
+				continue
+			var xforms: Array = []
+			var customs: Array = []
+			for i in region:
+				xforms.append(slots[i].transform)
+				slots[i].get_child(1).set_meta(JOINED, true)
+				customs.append(custom)
+			_join_node.add_child(_atlas.create_multimesh(_current_asset, xforms, _quality, customs, 0.0, 0.0, _wind_strength()))
+			_join_stats += Vector2i(1, region.size())
 	_apply_view()
+
+
+func _wind_strength() -> float:
+	return WIND_STRENGTH if _wind and _current_asset == WIND_ASSET else 0.0
+
+
+func _set_wind(on: bool) -> void:
+	_wind = on
+	OctaWind.set_wind(WIND_DIRECTION, WIND_SPEED)
+	for s in _slots():
+		s.get_child(1).wind_strength = _wind_strength()
+	_rebuild_join()
+
+
+func _set_chunk(on: bool) -> void:
+	if not on:
+		if is_instance_valid(_chunk_group):
+			_chunk_group.queue_free()
+			_chunk_group = null
+			_toast("Chunk LOD: removed")
+		return
+	if is_instance_valid(_chunk_group):
+		return
+	_toast("Chunk LOD: baking %d props..." % CHUNK_PROPS)
+	var g := OctaImpostorGroup.new()
+	g.name = "ChunkDemo"
+	g.position = Vector3(0, 0, -8)
+	add_child(g)
+	var s := OctaBakeSettings.new()
+	s.grid_size = 8
+	s.max_atlas_size = 512
+	s.material_maps = false
+	s.emission = false
+	s.half_res_material_maps = true
+	g.settings = s
+	g.chunk_lod_distance = CHUNK_DISTANCE
+	g.chunk_quality = OctaAtlas.Quality.HIGH
+	var props: Array[Node3D] = []
+	for i in CHUNK_PROPS:
+		var prop: Node3D = _models[_current_asset].duplicate()
+		prop.name = "ChunkProp%d" % (i + 1)
+		prop.position = Vector3((i - 1) * 2.6, 0, 0)
+		g.add_child(prop)
+		props.append(prop)
+	_chunk_group = g
+	var cs := g.chunk_settings()
+	var chunk_atlas := await OctaBaker.bake([g], self, cs)
+	if not is_instance_valid(g) or _chunk_group != g:
+		if is_instance_valid(g):
+			g.queue_free()
+		return
+	if chunk_atlas == null:
+		g.queue_free()
+		_chunk_group = null
+		_toast("Chunk LOD: bake failed")
+		return
+	for prop in props:
+		OctaLOD.attach_card(prop, _atlas, _current_asset, OctaLOD.Mode.DYNAMIC_LOD, CHUNK_DISTANCE, _quality)
+	g.attach_chunk(chunk_atlas, cs, CHUNK_DISTANCE)
+	_toast("Chunk LOD: %d props, one chunk card beyond %d m (press [C] to remove)" % [CHUNK_PROPS, int(CHUNK_DISTANCE)])
 
 
 func _set_quality(q: int) -> void:
@@ -696,6 +769,27 @@ func _unhandled_input(event: InputEvent) -> void:
 		_update_camera()
 	elif event is InputEventKey and event.pressed and not event.echo:
 		_on_key(event.keycode)
+
+
+func _fly(delta: float) -> void:
+	var dir := Vector3.ZERO
+	if Input.is_physical_key_pressed(KEY_UP):
+		dir -= _cam_pivot.basis.z
+	if Input.is_physical_key_pressed(KEY_DOWN):
+		dir += _cam_pivot.basis.z
+	if Input.is_physical_key_pressed(KEY_LEFT):
+		dir -= _cam_pivot.basis.x
+	if Input.is_physical_key_pressed(KEY_RIGHT):
+		dir += _cam_pivot.basis.x
+	if Input.is_physical_key_pressed(KEY_Q):
+		dir -= Vector3.UP
+	if Input.is_physical_key_pressed(KEY_E):
+		dir += Vector3.UP
+	if dir == Vector3.ZERO:
+		return
+	var speed := FLY_SPEED * (4.0 if Input.is_physical_key_pressed(KEY_SHIFT) else 1.0)
+	_cam_pivot.position += dir.normalized() * speed * delta
+	_cam_pivot.position.y = maxf(_cam_pivot.position.y, 0.4)
 
 
 func _toast(text: String) -> void:
@@ -779,6 +873,14 @@ func _on_plugin_key(k: Key) -> void:
 		KEY_O:
 			_set_auto_lod(not _auto_lod)
 			_flag("Auto LOD", _auto_lod, " (cards beyond %d m)" % LOD_DISTANCE)
+		KEY_K:
+			_set_wind(not _wind)
+			_flag("Wind", _wind, " (Foliage Tree impostors only%s)" % ("" if _current_asset == WIND_ASSET else ", press [2]"))
+		KEY_C:
+			if field:
+				_set_chunk(not is_instance_valid(_chunk_group))
+			else:
+				_toast("Chunk LOD needs Level 2")
 		KEY_J:
 			if field:
 				_set_joined(not _joined)
@@ -912,6 +1014,8 @@ func _process(delta: float) -> void:
 		_update_camera()
 	if _atlas == null:
 		return
+	if not _simulating_benchmark:
+		_fly(delta)
 	if _sun_spin:
 		_sun.rotation.y += deg_to_rad(SUN_SPIN_DEG) * delta
 	_frame_times[_frame_i % WAVE_POINTS] = delta * 1000.0
@@ -1062,7 +1166,7 @@ func _state_text(draws: int) -> String:
 		precise = "ON (Ultra, 2-3x)" if _quality == OctaAtlas.Quality.ULTRA else "ON (needs Ultra)"
 	var lod := "HOT-SWAP"
 	if _auto_lod:
-		lod = "AUTO %d m (%s)" % [LOD_DISTANCE, "crossfade %d m" % LOD_FADE if OctaLOD.fade_supported() else "pop"]
+		lod = "AUTO %d m (%s crossfade %d m)" % [LOD_DISTANCE, OctaLOD.fade_kind(), LOD_FADE]
 	var join := "n/a (Level 2)"
 	if _current_level == 2:
 		join = "OFF"
@@ -1072,16 +1176,17 @@ func _state_text(draws: int) -> String:
 			join += ", draws %d (was %d), CPU %.1f (was %.1f) ms" % [draws, _join_base.x, _smooth_cpu_ms, _join_base.y]
 	var fill: float = _scan.get("card_fill", {}).get(_atlas, -1.0)
 	var real: int = _scan.get("real_visible", 0) - (_join_stats.y if _joined and _is_impostor else 0)
+	var chunk := "OFF" if not is_instance_valid(_chunk_group) else "%d props at %d m" % [CHUNK_PROPS, int(CHUNK_DISTANCE)]
 	var total := _vram_mb()
 	return "■ Tex: %.1f MB  ■ Buf: %.1f MB  ■ Other: %.1f MB
 Total: %.1f MB / %.0f MB (%.1f%%)
 Quality: %s  •  Debug: %s  •  Write depth: %s
-Precise: %s  •  Shadows: %s (%d view)  •  Sun spin: %s
-LOD: %s  •  Join: %s
+Precise: %s  •  Shadows: %s (%d view)  •  Sun spin: %s  •  Wind: %s
+LOD: %s  •  Join: %s  •  Chunk: %s
 Cards: %d drawn / %d real  •  Card fill: %s" % [
 		_mem.x, _mem.y, _mem.z, total, VRAM_BUDGET_MB, clampf(total / VRAM_BUDGET_MB * 100.0, 0.0, 100.0),
 		OctaAtlas.Quality.keys()[_quality], OctaDebug.mode_names()[OctaDebug.mode], _onoff(_atlas.write_depth),
-		precise, _onoff(_sun.shadow_enabled), _atlas.shadow_views, _onoff(_sun_spin), lod, join,
+		precise, _onoff(_sun.shadow_enabled), _atlas.shadow_views, _onoff(_sun_spin), _onoff(_wind), lod, join, chunk,
 		_scan.get("impostor_visible", 0), real, "%.0f%%" % fill if fill >= 0.0 else "--"]
 
 

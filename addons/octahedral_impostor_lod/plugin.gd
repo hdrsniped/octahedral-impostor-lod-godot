@@ -1,14 +1,15 @@
 @tool
 extends EditorPlugin
 
-enum { BAKE, REMOVE, CHECK, SCENE, JOIN, REBAKE, HELP, GROUP, REBAKE_ALL, SELECT_ALL }
+enum { BAKE, REMOVE, CHECK, SCENE, JOIN, REBAKE, HELP, GROUP, REBAKE_ALL, SELECT_ALL, PACK }
 
 const HELP_TEXT := """[b]Menu (3D toolbar)[/b]
 [b]Bake Selected...[/b]  Bake the selected objects with the dialog settings. Pick a preset, then change anything (hover an option for help).
 [b]Bake Scene...[/b]  Checklist of every object with its on-screen size; small ones are pre-ticked. A group is one item.
-[b]Bake Group[/b]  Bake the selected OctaImpostorGroup with its own settings.
+[b]Bake Group[/b]  Bake the selected OctaImpostorGroup with its own settings. With a Chunk LOD distance on the group, one extra card of the whole group is baked for beyond that distance and the object cards stop there.
 [b]Re-bake Selected / Re-bake All Impostors in Scene[/b]  Bake again with the settings saved in each atlas (or its group). Properties you changed on a card are kept.
-[b]Join Selected Impostors[/b]  Merge nearby cards of one object into a MultiMesh (one draw call).
+[b]Join Selected Impostors[/b]  Merge nearby cards of one object into MultiMeshes, one per Join Cell (one draw call each). Adaptive Join (bake dialog, Scene and joining) also splits crowded cells into small regions in Z-order, so off-screen regions are skipped. Joined groups have no LOD distance: their real meshes are hidden and the impostors stay on at every distance (undo restores the meshes).
+[b]Pack Selected Atlases...[/b]  Merge the atlases of the selected cards into shared ones without re-baking (same grid, view size, padding and options). Cards then share one material per quality and can be joined. Undoable.
 [b]Remove Impostors from Selected[/b]  Delete cards and restore the real objects.
 [b]Check Quality of Selected[/b]  Compare card and real mesh from 8 angles.
 [b]Select Impostors in Scene[/b]  Select every card of the open scene.
@@ -21,6 +22,7 @@ Batch-edit the selected cards (quality, LOD, fade). Atlas options apply to every
 Quality Low, Medium, High, Ultra. Ultra + Complex shapes (split parts, back layer, precise search) fixes rings and see-through shapes; precise search is 2-3x slower on the GPU, use it for hero objects.
 Half-res material maps store roughness, metallic, occlusion and emission at a quarter of the memory.
 Shadow views 1-3: more views = smoother shadows when the light moves.
+Wind (off by default): a card's wind_strength sways the top of foliage in texture space; set direction and speed with OctaWind.set_wind().
 LOD by distance or by screen size (project setting octa_lod/reference_fov).
 
 [b]Command line and runtime[/b]
@@ -41,6 +43,7 @@ var _picker: ConfirmationDialog
 var _help: AcceptDialog
 var _settings := OctaBakeSettings.new()
 var _busy := false
+var _save_queued := false
 
 
 # --- Menu and dialog ---
@@ -56,6 +59,7 @@ func _enter_tree() -> void:
 	pm.add_item("Re-bake Selected Impostors", REBAKE)
 	pm.add_item("Re-bake All Impostors in Scene", REBAKE_ALL)
 	pm.add_item("Join Selected Impostors", JOIN)
+	pm.add_item("Pack Selected Atlases...", PACK)
 	pm.add_item("Remove Impostors from Selected", REMOVE)
 	pm.add_separator()
 	pm.add_item("Check Quality of Selected", CHECK)
@@ -90,15 +94,20 @@ func _enter_tree() -> void:
 	box.add_child(_info)
 	_inspector = EditorInspector.new()
 	_inspector.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	_inspector.property_edited.connect(func(_p: String) -> void:
-		_preset.select(0)
-		_update_info())
+	_inspector.property_edited.connect(func(p: String) -> void:
+		if _preset_owns(p):
+			_preset.select(0)
+		_queue_save()
+		_update_info()
+		_apply_hints.call_deferred())
 	box.add_child(_inspector)
 	_dialog.add_child(box)
 	_dialog.confirmed.connect(_bake)
 	EditorInterface.get_base_control().add_child(_dialog)
 	_load_settings()
+	_preset.select(_matching_preset())
 	_inspector.edit(_settings)
+	_apply_hints.call_deferred()
 	_build_progress()
 	_build_help()
 	_picker = preload("res://addons/octahedral_impostor_lod/octa_scene_picker.gd").new()
@@ -139,6 +148,8 @@ func _on_menu(id: int) -> void:
 			_remove()
 		JOIN:
 			join_cards(selected_cards())
+		PACK:
+			pack_atlases(selected_cards())
 		REBAKE:
 			rebake(selected_cards())
 		REBAKE_ALL:
@@ -181,7 +192,63 @@ func _on_preset(i: int) -> void:
 	_settings.apply_preset(i)
 	_inspector.edit(null)
 	_inspector.edit(_settings)
+	_apply_hints.call_deferred()
 	_update_info()
+	if i != OctaBakeSettings.Preset.CUSTOM:
+		_queue_save()
+
+
+func _matching_preset() -> int:
+	for i in range(OctaBakeSettings.Preset.CUSTOM + 1, OctaBakeSettings.PRESET_NAMES.size()):
+		var v := OctaBakeSettings.preset_values(i as OctaBakeSettings.Preset)
+		var same := true
+		for k: String in v:
+			if _settings.get(k) != v[k]:
+				same = false
+				break
+		if same:
+			return i
+	return OctaBakeSettings.Preset.CUSTOM
+
+
+func _preset_owns(p: String) -> bool:
+	var i := _preset.get_selected()
+	if i <= OctaBakeSettings.Preset.CUSTOM:
+		return false
+	return OctaBakeSettings.preset_values(i as OctaBakeSettings.Preset).has(p)
+
+
+func _apply_hints() -> void:
+	_apply_hints_to(_inspector)
+
+
+func _apply_hints_to(n: Node) -> void:
+	for c in n.get_children():
+		if c is EditorProperty:
+			var p := String((c as EditorProperty).get_edited_property())
+			var t: String = OctaBakeSettings.SHORT_HINTS.get(p, "")
+			if not t.is_empty():
+				_hint_control(c, t)
+		_apply_hints_to(c)
+
+
+func _hint_control(n: Node, t: String) -> void:
+	if n is Control and (n as Control).tooltip_text.is_empty():
+		(n as Control).tooltip_text = t
+	for c in n.get_children():
+		_hint_control(c, t)
+
+
+func _queue_save() -> void:
+	if _save_queued:
+		return
+	_save_queued = true
+	_do_save.call_deferred()
+
+
+func _do_save() -> void:
+	_save_queued = false
+	_save_settings()
 
 
 
@@ -254,13 +321,16 @@ func _bake() -> void:
 
 func rebake(cards: Array) -> void:
 	var root := EditorInterface.get_edited_scene_root()
+	if root == null:
+		return
+	var claimed := OctaImpostorGroup.claimed_nodes(root)
 	var by_atlas := {}
 	var groups: Array[OctaImpostorGroup] = []
 	for c in cards:
 		if not c is OctaImpostor:
 			continue
 		var src := _source_of(c)
-		var group := OctaImpostorGroup.group_of(src, root) if src != null and root != null else null
+		var group := OctaImpostorGroup.group_in(src, claimed) if src != null else null
 		if group != null:
 			if not groups.has(group):
 				groups.append(group)
@@ -383,6 +453,33 @@ func _run_bake(nodes: Array[Node3D], s: OctaBakeSettings, group: OctaImpostorGro
 		_toast("The scene changed during the bake; the atlas was saved to %s but no cards were added." % path, EditorToaster.SEVERITY_WARNING)
 		return false
 
+	var chunk_atlas: OctaAtlas = null
+	var chunk_settings: OctaBakeSettings = null
+	if group != null and group.chunk_lod_distance > 0.0:
+		chunk_settings = group.chunk_settings()
+		var chunk_path := "%s_chunk.res" % path.get_basename()
+		var cj := 2
+		while ResourceLoader.exists(chunk_path):
+			chunk_path = "%s_chunk_%d.res" % [path.get_basename(), cj]
+			cj += 1
+		_busy = true
+		var cjob := OctaBakeJob.new()
+		_job = cjob
+		_job.progress.connect(_on_progress)
+		_progress_bar.value = 0
+		_progress_label.text = "Baking the chunk card..."
+		_progress.popup_centered()
+		chunk_atlas = await OctaBaker.bake_to_file([group], EditorInterface.get_base_control(), chunk_path, chunk_settings, cjob)
+		_job = null
+		_progress.hide()
+		_busy = false
+		EditorInterface.get_resource_filesystem().scan()
+		if cjob.cancelled:
+			if chunk_atlas != null:
+				DirAccess.remove_absolute(ProjectSettings.globalize_path(chunk_path))
+			_toast("Bake cancelled during the chunk card. Nothing was changed.", EditorToaster.SEVERITY_WARNING)
+			return false
+
 	var ur := get_undo_redo()
 	ur.create_action("Bake Octahedral Impostors")
 	var replaced: Array[Node3D] = []
@@ -404,10 +501,21 @@ func _run_bake(nodes: Array[Node3D], s: OctaBakeSettings, group: OctaImpostorGro
 	if group != null:
 		ur.add_do_property(group, "atlas", atlas)
 		ur.add_undo_property(group, "atlas", group.atlas)
+	if group != null and chunk_atlas != null:
+		ur.add_do_method(group, "attach_chunk", chunk_atlas, chunk_settings, group.chunk_lod_distance)
+		ur.add_undo_method(group, "detach_chunk")
+		ur.add_do_reference(chunk_atlas)
+		for c in group.cards():
+			ur.add_undo_property(c, "visibility_range_end", c.visibility_range_end)
 	for k in replaced.size():
 		_remove_undo_actions(ur, old_sources[k], replaced[k])
 	ur.commit_action()
 	_toast("Baked %d object(s) into %s (%s)." % [bake_list.size(), path, s.describe(bake_list.size()).get_slice(" -> ", 1)])
+	if group != null and group.chunk_lod_distance > 0.0:
+		if chunk_atlas == null:
+			_toast("The chunk card bake failed; the object cards were baked. See the Output panel.", EditorToaster.SEVERITY_WARNING)
+		else:
+			_toast("Chunk card: the whole group becomes one card beyond %.0f m." % group.chunk_lod_distance)
 	_dock.refresh()
 	return true
 
@@ -510,7 +618,7 @@ func join_cards(cards: Array) -> void:
 	for c in cards:
 		if c is OctaImpostor and c.atlas != null and c.is_inside_tree():
 			var cell := Vector3i((c.global_position / _settings.join_cell).floor())
-			var key := "%d|%d|%d|%s" % [c.atlas.get_instance_id(), c.object_index, c.quality, cell]
+			var key := "%d|%d|%d|%s|%.3f" % [c.atlas.get_instance_id(), c.object_index, c.quality, cell, c.wind_strength]
 			if not groups.has(key):
 				groups[key] = []
 			groups[key].append(c)
@@ -518,8 +626,13 @@ func join_cards(cards: Array) -> void:
 	ur.create_action("Join Impostors")
 	var draw_calls := 0
 	var joined := 0
+	var parts: Array = []
 	for key in groups:
-		var g: Array = groups[key]
+		if _settings.join_adaptive and groups[key].size() >= 2:
+			parts.append_array(_regions(groups[key]))
+		else:
+			parts.append(groups[key])
+	for g: Array in parts:
 		if g.size() < 2:
 			continue
 		var first: OctaImpostor = g[0]
@@ -528,7 +641,7 @@ func join_cards(cards: Array) -> void:
 		for c: OctaImpostor in g:
 			xforms.append(root.global_transform.affine_inverse() * c.global_transform)
 			customs.append(OctaAtlas.joined_custom(c.tint, c.depth_multiplier))
-		var mmi := first.atlas.create_multimesh(first.object_index, xforms, first.quality, customs)
+		var mmi := first.atlas.create_multimesh(first.object_index, xforms, first.quality, customs, 0.0, 0.0, first.wind_strength)
 		var nm := "OctaJoined_%d" % (draw_calls + 1)
 		var i := 2
 		while root.has_node(NodePath(nm)):
@@ -554,6 +667,77 @@ func join_cards(cards: Array) -> void:
 	ur.commit_action()
 	_toast("Joined %d impostor(s) into %d draw call(s). Their real meshes are hidden; undo restores them." % [joined, draw_calls])
 	_dock.refresh()
+
+
+func pack_atlases(cards: Array) -> bool:
+	var root := EditorInterface.get_edited_scene_root()
+	if root == null:
+		return false
+	var sources: Array = []
+	for c in cards:
+		if c.atlas != null and not sources.has(c.atlas):
+			sources.append(c.atlas)
+	if sources.size() < 2:
+		_toast("Select impostors that use at least two different atlases to pack them into one.", EditorToaster.SEVERITY_WARNING)
+		return false
+	var limit := 4096
+	for a: OctaAtlas in sources:
+		limit = maxi(limit, maxi(a.albedo.get_width(), a.albedo.get_height()))
+	var map := {}
+	var packed := OctaPacker.pack(sources, limit, map)
+	if map.is_empty():
+		_toast("These atlases cannot be packed together: they differ in format, grid size, view size, padding, maps or atlas options.", EditorToaster.SEVERITY_WARNING)
+		return false
+	var created: Array = []
+	for s in map:
+		for oi in map[s]:
+			var pa: OctaAtlas = map[s][oi][0]
+			if not created.has(pa):
+				created.append(pa)
+	var scene := root.scene_file_path
+	var dir := scene.get_base_dir() if scene != "" else "res://"
+	var base := scene.get_file().get_basename() if scene != "" else ""
+	if base == "":
+		base = "packed"
+	if OctaPacker.save_packed(created, dir, base + "_packed").is_empty():
+		return false
+	EditorInterface.get_resource_filesystem().scan()
+	var ur := get_undo_redo()
+	ur.create_action("Pack Impostor Atlases")
+	var moved := 0
+	for c in cards:
+		if c.atlas == null or not map.has(c.atlas):
+			continue
+		var slot: Array = map[c.atlas].get(c.object_index, [])
+		if slot.is_empty() or (slot[0] == c.atlas and slot[1] == c.object_index):
+			continue
+		ur.add_do_property(c, "atlas", slot[0])
+		ur.add_undo_property(c, "atlas", c.atlas)
+		ur.add_do_property(c, "object_index", slot[1])
+		ur.add_undo_property(c, "object_index", c.object_index)
+		moved += 1
+	for pa: OctaAtlas in created:
+		ur.add_do_reference(pa)
+	ur.commit_action()
+	_toast("Packed %d atlas(es) into %d shared atlas(es); %d card(s) now share one material per quality." % [sources.size(), packed.size(), moved])
+	_dock.refresh()
+	EditorInterface.mark_scene_as_unsaved()
+	return true
+
+
+func _regions(members: Array) -> Array:
+	var points := PackedVector3Array()
+	var all := PackedInt32Array()
+	for k in members.size():
+		points.append(members[k].global_position)
+		all.append(k)
+	var out := []
+	for region: PackedInt32Array in OctaJoin.subdivide(points, all, _settings.join_region_size, _settings.join_region_count):
+		var cards := []
+		for k in region:
+			cards.append(members[k])
+		out.append(cards)
+	return out
 
 
 func selected_cards() -> Array:

@@ -4,6 +4,7 @@ class_name OctaImpostorGroup
 extends Node3D
 
 const PLUGIN_META := &"octa_lod_plugin"
+const END_META := &"octa_chunk_end"
 
 ## Bake settings of this group. Precedence, highest first: a card's own properties (lod distance,
 ## quality, tint, depth, LOD mode, screen size, fade, fade margin) set after baking, then these
@@ -14,6 +15,17 @@ const PLUGIN_META := &"octa_lod_plugin"
 @export var targets: Array[NodePath] = []
 ## The atlas made by the last bake of this group (one atlas for all its objects).
 @export var atlas: OctaAtlas
+
+@export_group("Chunk LOD")
+## Distance in meters beyond which the whole group is drawn as ONE card instead of one card per
+## object (0 = off). The chunk card is baked from the group's real meshes by "Bake Group" (or
+## "Re-bake Group"); the object cards stop at this distance. Keep chunks compact: a card is a
+## camera-facing quad.
+@export var chunk_lod_distance := 0.0
+## Shader quality of the chunk card (its atlas is baked with the group's settings).
+@export var chunk_quality := OctaAtlas.Quality.HIGH
+## The atlas of the chunk card, saved next to the group's own atlas.
+@export var chunk_atlas: OctaAtlas
 
 @export_group("Tools")
 @export_tool_button("Bake Group", "Play") var bake_action := _bake
@@ -41,7 +53,63 @@ func cards() -> Array[Node3D]:
 		for c in OctaLOD.find_cards_below(t):
 			if not out.has(c):
 				out.append(c)
+	for c in get_children():
+		if c.has_meta(OctaAtlas.CARD_META) and not out.has(c):
+			out.append(c)
 	return out
+
+
+func chunk_card() -> Node3D:
+	for c in get_children():
+		if c.has_meta(OctaAtlas.CHUNK_META):
+			return c
+	return null
+
+
+# --- Chunk LOD ---
+func attach_chunk(atlas_res: OctaAtlas, s: OctaBakeSettings, distance: float) -> Node3D:
+	detach_chunk()
+	chunk_atlas = atlas_res
+	var card := atlas_res.create_card(0, chunk_quality)
+	card.name = "OctaChunk"
+	card.set_meta(OctaAtlas.CHUNK_META, true)
+	card.set_meta(OctaLOD.SOURCE_META, NodePath(".."))
+	card.set_meta(OctaLOD.MODE_META, OctaLOD.Mode.DYNAMIC_LOD)
+	add_child(card)
+	if owner != null:
+		card.owner = owner
+	card.configure(s, OctaLOD.world_scale(self))
+	for c in cards():
+		if c != card:
+			if not c.has_meta(END_META):
+				c.set_meta(END_META, c.visibility_range_end)
+			c.visibility_range_end = distance
+	return card
+
+
+func detach_chunk() -> void:
+	var old := chunk_card()
+	for c in cards():
+		if c != old:
+			if c.has_meta(END_META):
+				c.visibility_range_end = float(c.get_meta(END_META))
+				c.remove_meta(END_META)
+			elif is_equal_approx(c.visibility_range_end, chunk_lod_distance):
+				c.visibility_range_end = 0.0
+	if old != null:
+		if old.get_parent() != null:
+			old.get_parent().remove_child(old)
+		old.queue_free()
+
+
+func chunk_settings() -> OctaBakeSettings:
+	var s := effective_settings().duplicate()
+	s.mode = OctaLOD.Mode.DYNAMIC_LOD
+	s.lod_mode = OctaLOD.LodMode.DISTANCE
+	s.lod_distance = chunk_lod_distance
+	s.fade = OctaLOD.Fade.NONE
+	s.quality = chunk_quality
+	return s
 
 
 func effective_settings() -> OctaBakeSettings:
@@ -63,10 +131,17 @@ static func find_all(root: Node) -> Array[OctaImpostorGroup]:
 
 
 static func group_of(node: Node, root: Node) -> OctaImpostorGroup:
-	for g in find_all(root):
-		for t in g.target_nodes():
-			if t == node or t.is_ancestor_of(node):
-				return g
+	return group_in(node, claimed_nodes(root))
+
+
+static func group_in(node: Node, claimed: Dictionary) -> OctaImpostorGroup:
+	if node is OctaImpostorGroup:
+		return node
+	var n := node
+	while n != null:
+		if claimed.has(n):
+			return claimed[n] as OctaImpostorGroup
+		n = n.get_parent()
 	return null
 
 

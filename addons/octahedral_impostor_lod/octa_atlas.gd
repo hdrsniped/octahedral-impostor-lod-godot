@@ -14,9 +14,17 @@ const SHADER_INCLUDE := "res://addons/octahedral_impostor_lod/shaders/octa_core.
 const MAX_OBJECTS := 1024
 const FORMAT_VERSION := 4
 const CARD_META := &"octa_card"
+const CHUNK_META := &"octa_chunk"
+const COVERAGE_BLOCK := 4
 const MIN_JOINED_DEPTH := 0.001
 const DEFAULT_SURFACE := Vector4(0.9, 0.0, 0.5, 0.0)
 const DEFAULT_MATERIAL := Vector4(1.0, 0.0, 1.0, 0.0)
+const V_PRECISE := 1
+const V_FADE := 2
+const V_WIND := 4
+const V_VISIBILITY := 8
+const V_PYRAMID := 16
+const V_PARALLAX := 32
 
 @export var format_version := 1
 @export var albedo: Texture2D
@@ -24,6 +32,7 @@ const DEFAULT_MATERIAL := Vector4(1.0, 0.0, 1.0, 0.0)
 @export var back_depth: Texture2D
 @export var orm: Texture2D
 @export var emission: Texture2D
+@export var max_coverage: Texture2D
 @export var grid_size := 12
 @export var hemisphere := true
 @export var parent_space := false
@@ -33,15 +42,27 @@ const DEFAULT_MATERIAL := Vector4(1.0, 0.0, 1.0, 0.0)
 @export var write_depth := true:
 	set(v):
 		write_depth = v
-		for q in materials.size():
-			if materials[q] != null:
-				materials[q].shader = shader_for(q, write_depth, -1, precise_search)
+		_update_shaders()
 @export var precise_search := false:
 	set(v):
 		precise_search = v
-		for q in materials.size():
-			if materials[q] != null:
-				materials[q].shader = shader_for(q, write_depth, -1, precise_search)
+		_update_shaders()
+
+@export var view_visibility := false:
+	set(v):
+		view_visibility = v
+		_update_shaders()
+
+@export var pyramid_search := false:
+	set(v):
+		pyramid_search = v
+		_update_shaders()
+
+@export var parallax_refine := false:
+	set(v):
+		parallax_refine = v
+		_update_shaders()
+
 @export_range(1, 3) var shadow_views := 1:
 	set(v):
 		shadow_views = v
@@ -52,55 +73,168 @@ const DEFAULT_MATERIAL := Vector4(1.0, 0.0, 1.0, 0.0)
 @export var bounds := PackedVector4Array()
 @export var surface_params := PackedVector4Array()
 @export var material_params := PackedVector4Array()
-@export var materials: Array[ShaderMaterial] = [null, null, null, null]
+var materials: Array[ShaderMaterial] = []
 @export var meshes: Array[Mesh] = []
 @export var bake_settings: OctaBakeSettings
 
+var card_fade := false:
+	set(v):
+		if card_fade == v:
+			return
+		card_fade = v
+		_update_shaders()
+
 var _obj_data: ImageTexture
+var _wind_users := {}
+var _wind_on := false
+var _stamp := 0
+var _param_stamp := {}
 
 static var _variants := {}
-static var _live: Array[WeakRef] = []
+static var _live := {}
 
 
 # --- Materials, meshes and cards ---
-static func shader_for(quality: int, depth: bool = true, debug: int = -1, precise: bool = false) -> Shader:
+static func shader_for(quality: int, depth: bool = true, debug: int = -1, precise: bool = false, fade: bool = false, wind: bool = false, visibility: bool = false, pyramid: bool = false, parallax: bool = false) -> Shader:
+	var flags := 0
+	if precise:
+		flags |= V_PRECISE
+	if fade:
+		flags |= V_FADE
+	if wind:
+		flags |= V_WIND
+	if visibility:
+		flags |= V_VISIBILITY
+	if pyramid:
+		flags |= V_PYRAMID
+	if parallax:
+		flags |= V_PARALLAX
+	return shader_variant(quality, depth, debug, flags)
+
+
+static func shader_variant(quality: int, depth: bool = true, debug: int = -1, flags: int = 0) -> Shader:
 	if debug < 0:
 		debug = OctaDebug.mode
-	precise = precise and quality == Quality.ULTRA
-	if depth and debug == 0 and not precise:
+	if quality != Quality.ULTRA:
+		flags &= ~(V_PRECISE | V_PYRAMID)
+	else:
+		flags &= ~V_VISIBILITY
+	if quality >= Quality.HIGH:
+		flags &= ~V_PARALLAX
+	if depth and debug == 0 and flags == 0:
 		return SHADERS[quality]
-	var key := quality * 100 + (10 if depth else 0) + debug + (1000 if precise else 0)
+	var key := quality * 100 + (10 if depth else 0) + debug + (1000 if flags & V_PRECISE else 0) + (2000 if flags & V_FADE else 0) + (4000 if flags & V_WIND else 0) + (8000 if flags & V_VISIBILITY else 0) + (16000 if flags & V_PYRAMID else 0) + (32000 if flags & V_PARALLAX else 0)
 	if not _variants.has(key):
+		var defs := PackedStringArray()
+		if not depth:
+			defs.append("#define NO_DEPTH_WRITE\n")
+		if flags & V_PRECISE:
+			defs.append("#define PRECISE_SEARCH\n")
+		if flags & V_FADE:
+			defs.append("#define CARD_FADE\n")
+		if flags & V_WIND:
+			defs.append("#define CARD_WIND\n")
+		if flags & V_VISIBILITY:
+			defs.append("#define VIEW_VISIBILITY\n")
+		if flags & V_PYRAMID:
+			defs.append("#define PYRAMID_SEARCH\n")
+		if flags & V_PARALLAX:
+			defs.append("#define PARALLAX_REFINE\n")
 		var s := Shader.new()
-		s.code = "shader_type spatial;\n#define QUALITY %d\n%s%s#define DEBUG_MODE %d\n#include \"%s\"\n" % [quality, "" if depth else "#define NO_DEPTH_WRITE\n", "#define PRECISE_SEARCH\n" if precise else "", debug, SHADER_INCLUDE]
+		s.code = "shader_type spatial;\n#define QUALITY %d\n%s#define DEBUG_MODE %d\n#include \"%s\"\n" % [quality, "".join(defs), debug, SHADER_INCLUDE]
 		_variants[key] = s
 	return _variants[key]
 
 
 static func live_atlases() -> Array[OctaAtlas]:
-	var keep: Array[WeakRef] = []
 	var out: Array[OctaAtlas] = []
-	for w in _live:
-		var a := w.get_ref() as OctaAtlas
-		if a != null:
-			keep.append(w)
+	for id: int in _live.keys():
+		var a: OctaAtlas = _live[id].get_ref()
+		if a == null:
+			_live.erase(id)
+		else:
 			out.append(a)
-	_live = keep
 	return out
 
 
 static func refresh_all_materials() -> void:
 	for a in live_atlases():
-		for q in a.materials.size():
-			if a.materials[q] != null:
-				a.materials[q].shader = shader_for(q, a.write_depth, -1, a.precise_search)
+		a._update_shaders()
+
+
+# --- Wind users ---
+func set_wind_user(user: Object, on: bool) -> void:
+	var before := _wind_on
+	if on:
+		_wind_users[user.get_instance_id()] = true
+	else:
+		_wind_users.erase(user.get_instance_id())
+	_wind_on = not _wind_users.is_empty()
+	if on:
+		_track()
+	if _wind_on != before:
+		_update_shaders()
+
+
+func wind_active() -> bool:
+	return _wind_on
+
+
+func wind_counts() -> Vector2i:
+	var cards := 0
+	var groups := 0
+	for id: int in _wind_users.keys():
+		if not is_instance_id_valid(id):
+			_wind_users.erase(id)
+		elif instance_from_id(id) is OctaJoinedGroup:
+			groups += 1
+		else:
+			cards += 1
+	_wind_on = not _wind_users.is_empty()
+	return Vector2i(cards, groups)
+
+
+func apply_wind() -> void:
+	if not wind_active():
+		return
+	for m in materials:
+		if m != null:
+			OctaWind.apply_to(m)
+
+
+func save_file() -> void:
+	if resource_path.begins_with("res://") and not resource_path.contains("::"):
+		ResourceSaver.save(self)
+
+
+func _update_shaders() -> void:
+	_stamp += 1
+	for q in materials.size():
+		if materials[q] != null:
+			materials[q].shader = _shader(q)
+			_apply_params(materials[q])
+	apply_wind()
+
+
+func refresh_materials() -> void:
+	_stamp += 1
+	for m in materials:
+		if m != null:
+			_apply_params(m)
+
+
+func _track() -> void:
+	_live[get_instance_id()] = weakref(self)
 
 
 func vram_bytes() -> int:
 	var total := 0.0
+	var bpp := 1.0 if albedo is PortableCompressedTexture2D else 4.0
 	for t: Texture2D in [albedo, normal_depth, orm, emission]:
-		total += _map_bytes(t, 4.0)
+		total += _map_bytes(t, bpp)
 	total += _map_bytes(back_depth, 1.0)
+	total += _map_bytes(max_coverage, 1.0, 1.0)
+	total += float(maxi(object_count(), 1)) * 64.0
 	return int(total)
 
 
@@ -111,8 +245,8 @@ func has_half_res_maps() -> bool:
 	return false
 
 
-static func _map_bytes(t: Texture2D, bytes_per_pixel: float) -> float:
-	return 0.0 if t == null else t.get_width() * t.get_height() * bytes_per_pixel * 4.0 / 3.0
+static func _map_bytes(t: Texture2D, bytes_per_pixel: float, mip_factor := 4.0 / 3.0) -> float:
+	return 0.0 if t == null else t.get_width() * t.get_height() * bytes_per_pixel * mip_factor
 
 
 func card_coverage(object_index: int) -> Dictionary:
@@ -132,9 +266,8 @@ func get_material(quality: Quality = Quality.HIGH) -> ShaderMaterial:
 		materials.resize(SHADERS.size())
 	if materials[quality] == null:
 		materials[quality] = ShaderMaterial.new()
-	if not _live.any(func(w: WeakRef) -> bool: return w.get_ref() == self):
-		_live.append(weakref(self))
-	var want := shader_for(quality, write_depth, -1, precise_search)
+	_track()
+	var want := _shader(quality)
 	if materials[quality].shader != want:
 		materials[quality].shader = want
 	_apply_params(materials[quality])
@@ -142,6 +275,9 @@ func get_material(quality: Quality = Quality.HIGH) -> ShaderMaterial:
 
 
 func _apply_params(m: ShaderMaterial) -> void:
+	var id := m.get_instance_id()
+	if _param_stamp.get(id, -1) == _stamp:
+		return
 	m.set_shader_parameter("albedo_atlas", albedo)
 	m.set_shader_parameter("normal_atlas", normal_depth)
 	m.set_shader_parameter("grid_size", grid_size)
@@ -153,9 +289,20 @@ func _apply_params(m: ShaderMaterial) -> void:
 	m.set_shader_parameter("use_orm", orm != null)
 	m.set_shader_parameter("emission_atlas", emission)
 	m.set_shader_parameter("use_emission", emission != null)
-	if m.shader == shader_for(Quality.ULTRA, write_depth, -1, precise_search):
+	m.set_shader_parameter("max_coverage", max_coverage)
+	if m.shader == _shader(Quality.ULTRA):
 		m.set_shader_parameter("back_atlas", back_depth)
 		m.set_shader_parameter("use_back_layer", back_depth != null)
+	if bake_settings != null and m.shader == _shader(Quality.ULTRA):
+		m.set_shader_parameter("search_steps", bake_settings.search_steps)
+		m.set_shader_parameter("layer_tolerance", bake_settings.layer_tolerance)
+	if wind_active():
+		OctaWind.apply_to(m)
+	_param_stamp[id] = _stamp
+
+
+func _shader(quality: int) -> Shader:
+	return shader_for(quality, write_depth, -1, precise_search, card_fade and not OctaLOD.fade_supported(), wind_active(), view_visibility, pyramid_search, parallax_refine)
 
 
 func object_data() -> ImageTexture:
@@ -176,6 +323,7 @@ func object_data() -> ImageTexture:
 		img.set_pixel(2, i, Color(at.x, at.y, cell.x, cell.y))
 		img.set_pixel(3, i, Color(mp.x, mp.y, mp.z, mp.w))
 	_obj_data = ImageTexture.create_from_image(img)
+	_stamp += 1
 	return _obj_data
 
 
@@ -210,7 +358,7 @@ static func joined_custom(tint: Color, depth: float) -> Color:
 	return Color(lin.r, lin.g, lin.b, maxf(depth, MIN_JOINED_DEPTH))
 
 
-func create_multimesh(index: int, transforms: Array, quality: Quality = Quality.HIGH, customs: Array = []) -> MultiMeshInstance3D:
+func create_multimesh(index: int, transforms: Array, quality: Quality = Quality.HIGH, customs: Array = [], lod_distance := 0.0, fade_margin := 0.0, wind_strength := 0.0) -> MultiMeshInstance3D:
 	var mm := MultiMesh.new()
 	mm.transform_format = MultiMesh.TRANSFORM_3D
 	mm.use_custom_data = not customs.is_empty()
@@ -221,12 +369,33 @@ func create_multimesh(index: int, transforms: Array, quality: Quality = Quality.
 		if mm.use_custom_data:
 			var c: Color = customs[i]
 			mm.set_instance_custom_data(i, Color(c.r, c.g, c.b, maxf(c.a, MIN_JOINED_DEPTH)))
-	var mmi := MultiMeshInstance3D.new()
+	var mmi := OctaJoinedGroup.new()
 	mmi.name = "ImpostorMultiMesh"
 	mmi.multimesh = mm
+	mmi.atlas = self
 	mmi.material_override = get_material(quality)
 	mmi.set_instance_shader_parameter("octa_index", index)
+	mmi.wind_strength = wind_strength
+	if lod_distance > 0.0 and fade_margin > 0.0 and not OctaLOD.fade_supported():
+		card_fade = true
+		mmi.set_instance_shader_parameter("card_fade", OctaLOD.fade_band(lod_distance, fade_margin))
 	return mmi
+
+
+func create_multimeshes(index: int, transforms: Array, quality: Quality = Quality.HIGH, customs: Array = [], join_cell := 50.0, adaptive := true, region_size := 20.0, region_count := 128, lod_distance := 0.0, fade_margin := 0.0, wind_strength := 0.0) -> Array[MultiMeshInstance3D]:
+	var points := PackedVector3Array()
+	for t: Transform3D in transforms:
+		points.append(t.origin)
+	var out: Array[MultiMeshInstance3D] = []
+	for region: PackedInt32Array in OctaJoin.partition(points, join_cell, adaptive, region_size, region_count):
+		var xs: Array = []
+		var cs: Array = []
+		for i in region:
+			xs.append(transforms[i])
+			if not customs.is_empty():
+				cs.append(customs[i])
+		out.append(create_multimesh(index, xs, quality, cs, lod_distance, fade_margin, wind_strength))
+	return out
 
 
 # --- View directions (same math as the shader) ---

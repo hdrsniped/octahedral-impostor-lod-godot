@@ -4,18 +4,62 @@ extends Resource
 
 enum Compression { LOSSLESS, VRAM }
 
-enum Preset { CUSTOM, MOBILE, BALANCED, HIGH_QUALITY, COMPLEX_SHAPES }
+enum Preset { CUSTOM, MINIMAL, FAST, QUALITY, MAX }
 
-const PRESET_NAMES := ["Custom", "Mobile", "Balanced", "High quality", "Complex shapes"]
+const PRESET_NAMES := ["Custom", "Minimal", "Fast", "Quality", "Max"]
 const PRESET_TIPS := [
 	"Keeps the settings exactly as you edit them.",
-	"Low quality, 1024 atlas, VRAM compression, 10x10 views, flat depth (no depth write), half-res material maps, 1 shadow view. Smallest and cheapest.",
-	"Medium quality, 2048 atlas, VRAM compression, 12x12 views, depth on, half-res material maps, 1 shadow view.",
-	"High quality, 4096 atlas, lossless, 16x16 views, depth on, crossfade (Forward+), full-res material maps, 2 shadow views.",
-	"Ultra with split parts, back layer and 12 search steps, 2048 atlas, lossless, depth on, half-res material maps, 1 shadow view. Precise search stays off (2-3x slower on the GPU): turn it on for hero objects.",
+	"The fastest this addon gets: Low quality, 8x8 views on a 1024 atlas, VRAM compression, no material maps, flat depth (the card does not cast or self-shadow), 1 shadow view.",
+	"For many props at once: High quality, 10x10 views on a 2048 atlas, VRAM compression, half-res material maps, 1 shadow view.",
+	"The best quality without trading much performance: High quality, 16x16 views on a 4096 atlas, lossless, full-res material maps, 2 shadow views.",
+	"Maximum quality at any cost: Ultra with precise search, split parts, back layer and 24 search steps, 16x16 views on a 4096 atlas, lossless, full-res material maps, 3 shadow views, 8x MSAA capture.",
 ]
 const COST := [1.0, 3.0, 5.0, 10.0]
 const AVERAGED_NOTE := "Material maps are off: roughness and metallic are averaged over each object's materials"
+const SHORT_HINTS := {
+	"mode": "How the card is placed: Dynamic LOD, Duplicate or Replace.",
+	"strip_source": "Replace mode: delete the real object after baking.",
+	"lod_mode": "When the card takes over: distance or screen size.",
+	"lod_distance": "Distance in meters where the card replaces the mesh.",
+	"lod_screen_percent": "Screen height where the card takes over.",
+	"fade": "Dither the card in instead of popping.",
+	"fade_margin": "Width of the crossfade band around the distance.",
+	"fade_real_mesh": "Also fade the real mesh out.",
+	"quality": "Shader cost and accuracy: Low, Medium, High, Ultra.",
+	"write_depth": "Card writes depth (needed for its shadow).",
+	"split_parts": "Bake each mesh part separately (odd shapes).",
+	"back_layer": "Extra depth map for see-through shapes.",
+	"search_steps": "Ultra only: ray steps per view.",
+	"precise_search": "Ultra only: smarter search, 2-3x slower.",
+	"layer_tolerance": "Ultra only: how thick a surface counts as solid.",
+	"view_visibility": "Weight views by how much of the object they show.",
+	"coverage_pyramid": "Bake a coarse coverage map for the pyramid search.",
+	"parallax_refine": "Low/Medium: 3 depth samples instead of 1.",
+	"dedupe": "Skip objects that already have a card.",
+	"scene_pick_percent": "Bake Scene: only objects smaller than this.",
+	"join_cell": "Join: one MultiMesh per cell of this size.",
+	"join_adaptive": "Join: split crowded cells into small regions.",
+	"join_region_size": "Adaptive join: maximum region size.",
+	"join_region_count": "Adaptive join: maximum instances per region.",
+	"grid_size": "Views per side. More views, less detail per view.",
+	"max_atlas_size": "Atlas texture size in pixels.",
+	"output_dir": "Where baked atlases are saved.",
+	"hemisphere": "Side and top views only (half the views).",
+	"material_maps": "Bake roughness, metallic and AO.",
+	"emission": "Bake emission where something glows.",
+	"half_res_material_maps": "Material maps at half resolution (less memory).",
+	"compression": "VRAM compression (smaller, lossy) or lossless.",
+	"shadow_views": "Views blended in the shadow pass (1-3).",
+	"wind_strength": "Sway amount for foliage cards.",
+	"frame_resolution": "View size in pixels; 0 picks it from the atlas.",
+	"msaa": "Capture antialiasing.",
+	"padding_px": "Empty border around each view.",
+	"batch_size": "Views rendered per pass (memory).",
+}
+
+var _scan_sig := 0
+var _scan_has_map := false
+var _scan_mixed := false
 
 @export_group("Placement")
 ## Dynamic LOD = real mesh up close, card beyond the LOD distance. Duplicate = card added next to
@@ -32,11 +76,17 @@ const AVERAGED_NOTE := "Material maps are off: roughness and metallic are averag
 ## height. Converted to a distance for each object with the camera field of view (project setting
 ## octa_lod/reference_fov, default 75 degrees).
 @export_range(0.1, 100.0, 0.1, "suffix:%") var lod_screen_percent := 5.0
-## Crossfade dithers the real mesh into the card over the fade distance instead of popping.
-## Forward+ only; Mobile and Compatibility pop (Godot does not fade there). Not used by Replace mode.
+## Crossfade dithers the card in over the real mesh instead of popping. Works on every renderer
+## (Godot's own fade on Forward+, a screen-space dither in the card shader on Mobile and
+## Compatibility). Not used by Replace mode.
 @export var fade := OctaLOD.Fade.NONE
-## Crossfade only: how many meters the transition takes after the LOD distance.
+## Crossfade only: the transition runs from the LOD distance minus this margin to the LOD distance
+## plus this margin.
 @export_range(0.0, 100.0, 0.5, "or_greater", "suffix:m") var fade_margin := 5.0
+## Crossfade on Mobile and Compatibility only: also dither the real mesh out over the same band, using
+## material copies (your own materials stay untouched). Materials that cannot fade (shaders, own
+## distance fade) keep the overlap: the card fades in, then the real mesh switches off behind it.
+@export var fade_real_mesh := true
 
 @export_group("Quality")
 ## Shader quality. Low = 1 view (fastest), Medium = 3 blended views, High = 3 views + depth parallax,
@@ -60,6 +110,14 @@ const AVERAGED_NOTE := "Material maps are off: roughness and metallic are averag
 ## Ultra only: hides views that disagree about which surface is in front.
 ## 0 = off. Higher = keeps more views (smoother, but more ghosting).
 @export_range(0.0, 1.0, 0.01) var layer_tolerance := 0.15
+## Low/Medium/High only: fades out views that disagree about the depth of a pixel (thin-part ghosting). Off = the shipped shaders.
+@export var view_visibility := false
+## Ultra only: bakes a max-coverage map and uses it to skip empty space in the ray search (conservative, so thin parts are not stepped over). Off = the shipped Ultra search.
+@export var coverage_pyramid := false
+## Low and Medium only (High already uses 3 samples): give them the 3-sample parallax loop.
+## follows the baked depth, which fixes most of the skew at the silhouette. Up to 48% fewer
+## wrong pixels at Medium (+3% GPU at Low, +9% at Medium). Off = the shipped shaders.
+@export var parallax_refine := false
 
 @export_group("Scene and joining")
 ## Objects that share the same meshes and materials are baked once and share one atlas entry.
@@ -68,6 +126,12 @@ const AVERAGED_NOTE := "Material maps are off: roughness and metallic are averag
 @export_range(1.0, 100.0, 0.5, "suffix:%") var scene_pick_percent := 10.0
 ## Joined impostors are grouped in squares this size (meters), so off-screen groups can be skipped.
 @export_range(5.0, 500.0, 0.5, "or_greater", "suffix:m") var join_cell := 50.0
+## Split each Join Cell into smaller regions (a median split until a region is within the size and count limits) and order the instances of every group along a Z-order curve. Each joined group gets a small bounding box, so off-screen regions are skipped as a whole. Off = one group per cell in the order of the cards, as in v2.1.
+@export var join_adaptive := false
+## Adaptive join: a region is split until its instances span at most this size on every axis (meters, measured between the card centers).
+@export_range(2.0, 200.0, 0.5, "or_greater", "suffix:m") var join_region_size := 20.0
+## Adaptive join: a region is split until it holds at most this many instances.
+@export_range(4, 4096, 1, "or_greater") var join_region_count := 128
 
 @export_group("Atlas")
 ## Views per side for each object (grid_size² views). More views = smoother
@@ -77,7 +141,7 @@ const AVERAGED_NOTE := "Material maps are off: roughness and metallic are averag
 ## the detail. Turn off for objects you also see from below (ships, floating things).
 @export var hemisphere := true
 ## Atlas width/height in pixels. Bigger = sharper cards and more video memory.
-@export_enum("256:256", "512:512", "1024:1024", "2048:2048", "4096:4096", "8192:8192") var max_atlas_size := 2048
+@export_enum("256:256", "512:512", "1024:1024", "2048:2048", "2896:2896", "4096:4096", "8192:8192") var max_atlas_size := 2048
 ## Also capture roughness, metallic and ambient occlusion per pixel from the source
 ## materials (one more atlas texture). Off = one roughness/metallic value per object, averaged
 ## over its materials (objects that mix shiny and rough materials lose that difference).
@@ -101,6 +165,10 @@ const AVERAGED_NOTE := "Material maps are off: roughness and metallic are averag
 ## Views blended in the shadow pass. 1 is fastest; 3 avoids shadow popping when the light moves (day/night cycles).
 @export_range(1, 3) var shadow_views := 1
 
+@export_group("Wind")
+## Far-field wind sway given to every new card (0 = off, the default; 1 = the top leans downwind by 20% of the object's radius). For foliage only: the base stays fixed and the top moves, done in texture space with no bigger bounds. Atlases without wind keep the normal shader. Set direction and speed with OctaWind.set_wind(). Adds about 4-10% to the card shader time while it is on (measured on an iGPU, noisy).
+@export_range(0.0, 1.0, 0.01) var wind_strength := 0.0
+
 @export_group("Advanced")
 ## Pixels per view. 0 = automatic (largest that fits in max_atlas_size).
 @export_range(0, 1024) var frame_resolution := 0
@@ -120,24 +188,33 @@ func layout(count: int) -> Dictionary:
 	if frame <= 0:
 		frame = max_atlas_size / (maxi(cols, rows) * grid_size)
 	frame = maxi(frame, 8)
+	while frame * maxi(grid_size, 1) % OctaAtlas.COVERAGE_BLOCK != 0:
+		frame += 1
 	return {cols = cols, rows = rows, frame = frame, side = maxi(cols, rows) * grid_size * frame}
 
 
 # --- Presets and estimates ---
-func apply_preset(p: Preset) -> void:
-	var base := {split_parts = false, back_layer = false, search_steps = 8, precise_search = false, write_depth = true, fade = OctaLOD.Fade.NONE,
-			half_res_material_maps = true, shadow_views = 1}
+static func preset_values(p: Preset) -> Dictionary:
 	var v := {
-		Preset.MOBILE: {quality = OctaAtlas.Quality.LOW, max_atlas_size = 1024, compression = Compression.VRAM, grid_size = 10, write_depth = false},
-		Preset.BALANCED: {quality = OctaAtlas.Quality.MEDIUM, max_atlas_size = 2048, compression = Compression.VRAM, grid_size = 12},
-		Preset.HIGH_QUALITY: {quality = OctaAtlas.Quality.HIGH, max_atlas_size = 4096, compression = Compression.LOSSLESS, grid_size = 16,
-				fade = OctaLOD.Fade.CROSSFADE, half_res_material_maps = false, shadow_views = 2},
-		Preset.COMPLEX_SHAPES: {quality = OctaAtlas.Quality.ULTRA, max_atlas_size = 2048, compression = Compression.LOSSLESS, grid_size = 12,
-				split_parts = true, back_layer = true, search_steps = 12},
+		Preset.MINIMAL: {quality = OctaAtlas.Quality.LOW, grid_size = 8, max_atlas_size = 1024, compression = Compression.VRAM,
+				write_depth = false, material_maps = false, emission = false, search_steps = 2},
+		Preset.FAST: {quality = OctaAtlas.Quality.HIGH, grid_size = 10, max_atlas_size = 2048, compression = Compression.VRAM},
+		Preset.QUALITY: {quality = OctaAtlas.Quality.HIGH, grid_size = 16, max_atlas_size = 4096, compression = Compression.LOSSLESS,
+				half_res_material_maps = false, shadow_views = 2},
+		Preset.MAX: {quality = OctaAtlas.Quality.ULTRA, grid_size = 16, max_atlas_size = 4096, compression = Compression.LOSSLESS,
+				split_parts = true, back_layer = true, precise_search = true, search_steps = 24, hemisphere = true,
+				half_res_material_maps = false, shadow_views = 3, msaa = Viewport.MSAA_8X},
 	}.get(p, {})
 	if v.is_empty():
-		return
-	v.merge(base)
+		return v
+	v.merge({split_parts = false, back_layer = false, search_steps = 8, precise_search = false, write_depth = true,
+			material_maps = true, emission = true, half_res_material_maps = true, shadow_views = 1,
+			parallax_refine = false, coverage_pyramid = false, view_visibility = false, fade = OctaLOD.Fade.CROSSFADE})
+	return v
+
+
+func apply_preset(p: Preset) -> void:
+	var v := preset_values(p)
 	for k: String in v:
 		set(k, v[k])
 
@@ -148,6 +225,8 @@ func cost_text(sources: Array = []) -> String:
 		extra = " Material maps add 1 texture read per view%s%s." % [" (none when every material is constant)" if material_maps else "", " (emission: one more when something glows)" if emission else ""]
 	if precise_search and quality == OctaAtlas.Quality.ULTRA:
 		extra += " Precise search: about 2-3x slower on the GPU."
+	if parallax_refine and quality < OctaAtlas.Quality.HIGH:
+		extra += " Parallax refine: 3 depth samples per view instead of 1, up to +9% GPU."
 	if shadow_views > 1:
 		extra += " %d shadow views: smoother shadows when the light moves, a slower shadow pass." % shadow_views
 	if averages_materials(sources):
@@ -156,14 +235,31 @@ func cost_text(sources: Array = []) -> String:
 
 
 func averages_materials(sources: Array) -> bool:
-	return not material_maps and not sources.is_empty() and OctaBaker.has_mixed_constants(sources, split_parts)
+	_scan(sources)
+	return not material_maps and not sources.is_empty() and _scan_mixed
+
+
+func needs_material_map(sources: Array) -> bool:
+	_scan(sources)
+	return _scan_has_map
+
+
+func _scan(sources: Array) -> void:
+	var sig := hash(split_parts)
+	for n in sources:
+		sig += int(n.get_instance_id())
+	if sig == _scan_sig:
+		return
+	_scan_sig = sig
+	_scan_has_map = OctaBaker.needs_material_map(sources, split_parts)
+	_scan_mixed = OctaBaker.has_mixed_constants(sources, split_parts)
 
 
 func describe(count: int, sources: Array = []) -> String:
 	var l := layout(count)
 	var layer := float(l.side * l.side) * (1.0 if compression == Compression.VRAM else 4.0) * 4.0 / 3.0
 	var map_scale := 0.25 if half_res_material_maps else 1.0
-	var has_map := material_maps and (sources.is_empty() or OctaBaker.needs_material_map(sources, split_parts))
+	var has_map := material_maps and (sources.is_empty() or needs_material_map(sources))
 	var bytes := layer * (2.0 + (0.25 if back_layer else 0.0) + (map_scale if has_map else 0.0))
 	var notes := ""
 	if material_maps and not has_map:
@@ -172,6 +268,8 @@ func describe(count: int, sources: Array = []) -> String:
 		notes += " (+%.0f MB if something glows)" % (layer * map_scale / 1048576.0)
 	if precise_search and quality == OctaAtlas.Quality.ULTRA:
 		notes += " (precise ray search)"
+	if parallax_refine and quality < OctaAtlas.Quality.HIGH:
+		notes += " (parallax refine)"
 	if averages_materials(sources):
 		notes += " (%s)" % AVERAGED_NOTE
 	return "%d object(s) -> %dx%d atlas, %d px per view, ~%.0f MB of video memory%s" % [count, l.cols * grid_size * l.frame, l.rows * grid_size * l.frame, l.frame, bytes / 1048576.0, notes]

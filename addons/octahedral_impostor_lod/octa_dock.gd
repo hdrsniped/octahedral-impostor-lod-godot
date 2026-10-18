@@ -9,14 +9,21 @@ var _lod: SpinBox
 var _lod_mode: OptionButton
 var _fade: OptionButton
 var _fade_margin: SpinBox
+var _fade_mesh: CheckBox
 var _depth: CheckBox
 var _precise: CheckBox
 var _shadow_views: SpinBox
+var _wind: SpinBox
 var _debug: OptionButton
 var _group_info: Label
 var _group_buttons: Array[Button] = []
 var _batch: Array[Control] = []
 var _joins: Array[Button] = []
+var _refresh_pending := false
+var _group_key := 0
+var _group_text := ""
+var _group_counts := {}
+var _settings_links: Array[OctaBakeSettings] = []
 
 
 # --- Layout ---
@@ -36,10 +43,11 @@ func _init(plugin: EditorPlugin) -> void:
 	actions.add_child(_button("Check Quality", "Compare the impostors with the real meshes from 8 angles.", _plugin._check))
 	actions.add_child(_button("Bake Scene...", "Pick objects from the whole scene to bake with a checklist.", _plugin.open_scene_picker))
 	actions.add_child(_button("Remove", "Remove the impostors of the selected objects (undoable).", _plugin._remove))
-	var join := _button("Join", "Merge the selected impostors that are close together into one draw call (undoable). Their real meshes are hidden.", _join)
+	var join := _button("Join", "Merge the selected impostors that are close together into one draw call per group (undoable). Join Cell, Adaptive Join and the region limits are in the bake dialog. Their real meshes are hidden.", _join)
 	actions.add_child(join)
 	var rebake := _button("Re-bake", "Bake the selected impostors again with their saved settings.", _rebake)
 	actions.add_child(rebake)
+	actions.add_child(_button("Pack Atlases", "Merge the atlases of the selected impostors into shared ones without re-baking, so their cards share one material and can be joined (undoable). Atlases must agree on grid size, view size, padding and atlas options.", _pack))
 	_joins = [join, rebake]
 	actions.add_child(_button("Select Impostors", "Select the impostor cards of the selected objects.", _select_cards))
 	actions.add_child(_button("Select Sources", "Select the real objects of the selected cards.", _select_sources))
@@ -87,16 +95,23 @@ func _init(plugin: EditorPlugin) -> void:
 	_fade = OptionButton.new()
 	_fade.add_item("None")
 	_fade.add_item("Crossfade")
-	_fade.tooltip_text = "Crossfade dithers the real mesh into the card. Forward+ only; not used by Replace mode."
+	_fade.tooltip_text = "Crossfade dithers the card in over the real mesh instead of popping. Works on every renderer (Godot's own fade on Forward+, a screen-space dither on Mobile and Compatibility). Not used by Replace mode."
 	fade_row.add_child(_fade)
 	_fade_margin = SpinBox.new()
 	_fade_margin.max_value = 100.0
 	_fade_margin.step = 0.5
 	_fade_margin.suffix = "m"
+	_fade_margin.tooltip_text = "The crossfade runs from the LOD distance minus this margin to the LOD distance plus this margin."
 	_fade_margin.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	fade_row.add_child(_fade_margin)
 	grid.add_child(fade_row)
 	grid.add_child(_button("Apply", "Set the fade of the selected cards (undoable).", _apply_fade))
+	grid.add_child(_label("Fade real mesh"))
+	_fade_mesh = CheckBox.new()
+	_fade_mesh.text = "On"
+	_fade_mesh.tooltip_text = "Mobile and Compatibility with Crossfade: also dither the real mesh out over the same band (material copies, your materials stay untouched). Off, or for shader materials, the card fades in and the mesh switches off behind it."
+	grid.add_child(_fade_mesh)
+	grid.add_child(_button("Apply", "Set the real mesh fade of the selected cards (undoable).", _apply_fade_mesh))
 	grid.add_child(_label("Write depth"))
 	_depth = CheckBox.new()
 	_depth.text = "On"
@@ -117,10 +132,19 @@ func _init(plugin: EditorPlugin) -> void:
 	_shadow_views.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	grid.add_child(_shadow_views)
 	grid.add_child(_button("Apply", "Set the shadow views for the atlases of the selected cards (undoable).", _apply_shadow_views))
+	grid.add_child(_label("Wind"))
+	_wind = SpinBox.new()
+	_wind.min_value = 0.0
+	_wind.max_value = 1.0
+	_wind.step = 0.01
+	_wind.tooltip_text = "Far-field sway for foliage, per card. 0 = off (the atlas keeps the normal shader). At 1 the top leans downwind by 20% of the object's radius while the base stays fixed. Direction and speed: OctaWind.set_wind()."
+	_wind.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	grid.add_child(_wind)
+	grid.add_child(_button("Apply", "Set the wind strength of the selected cards (undoable).", _apply_wind))
 	add_child(grid)
 	var shared := _button("Edit Shared Look", "Open the material shared by every card of this atlas and quality.", _edit_shared)
 	add_child(shared)
-	_batch.append_array([_quality, _lod, _lod_mode, _fade, _fade_margin, _depth, _precise, _shadow_views, shared])
+	_batch.append_array([_quality, _lod, _lod_mode, _fade, _fade_margin, _fade_mesh, _depth, _precise, _shadow_views, _wind, shared])
 	_batch.append_array(grid.get_children().filter(func(c: Node) -> bool: return c is Button))
 
 	add_child(HSeparator.new())
@@ -136,7 +160,7 @@ func _init(plugin: EditorPlugin) -> void:
 	add_child(_heading("Atlas"))
 	_info = _label()
 	add_child(_info)
-	EditorInterface.get_selection().selection_changed.connect(refresh)
+	EditorInterface.get_selection().selection_changed.connect(_queue_refresh)
 	refresh.call_deferred()
 
 
@@ -167,8 +191,16 @@ func _exit_tree() -> void:
 
 
 # --- State ---
+func _queue_refresh() -> void:
+	if _refresh_pending:
+		return
+	_refresh_pending = true
+	refresh.call_deferred()
+
+
 func _cards() -> Array[Node3D]:
 	var out: Array[Node3D] = []
+	_group_counts.clear()
 	for n in EditorInterface.get_selection().get_top_selected_nodes():
 		if not n.is_inside_tree():
 			continue
@@ -177,6 +209,7 @@ func _cards() -> Array[Node3D]:
 			found.append(n)
 		elif n is OctaImpostorGroup:
 			found = n.cards()
+			_group_counts[n.get_instance_id()] = found.size()
 		elif n is Node3D:
 			found = OctaLOD.find_cards_below(n)
 		for c in found:
@@ -186,6 +219,7 @@ func _cards() -> Array[Node3D]:
 
 
 func refresh() -> void:
+	_refresh_pending = false
 	if not is_inside_tree():
 		return
 	var cards := _cards()
@@ -194,8 +228,7 @@ func refresh() -> void:
 	var groups: Array[OctaImpostorGroup] = _plugin._selected_groups()
 	for b in _group_buttons:
 		b.disabled = groups.is_empty()
-	_group_info.text = "No group selected. Add an OctaImpostorGroup node to bake objects with shared settings, then select it here." if groups.is_empty() else "
-".join(groups.map(func(g: OctaImpostorGroup) -> String: return g.info()))
+	_group_info.text = _group_info_text(groups)
 	for c in _batch:
 		c.set("disabled", cards.is_empty())
 	for b in _joins:
@@ -216,10 +249,52 @@ func refresh() -> void:
 	_lod.value = card.lod_distance if card.lod_mode == OctaLOD.LodMode.DISTANCE else card.screen_percent
 	_fade.select(card.fade)
 	_fade_margin.value = card.fade_margin
+	_fade_mesh.button_pressed = card.fade_real_mesh
 	_depth.button_pressed = card.atlas.write_depth
 	_precise.button_pressed = card.atlas.precise_search
 	_shadow_views.value = card.atlas.shadow_views
+	_wind.value = card.wind_strength
 	_info.text = _atlas_text(card.atlas)
+
+
+func _group_info_text(groups: Array[OctaImpostorGroup]) -> String:
+	_link_settings(groups)
+	if groups.is_empty():
+		_group_key = 0
+		return "No group selected. Add an OctaImpostorGroup node to bake objects with shared settings, then select it here."
+	var key := _group_signature(groups)
+	if key != _group_key:
+		_group_key = key
+		_group_text = "\n".join(groups.map(func(g: OctaImpostorGroup) -> String: return g.info()))
+	return _group_text
+
+
+func _group_signature(groups: Array[OctaImpostorGroup]) -> int:
+	var h := groups.size()
+	for n in EditorInterface.get_selection().get_top_selected_nodes():
+		h = hash([h, n.get_instance_id()])
+	for g in groups:
+		h = hash([h, g.get_instance_id(), g.settings.get_instance_id() if g.settings != null else 0, g.target_nodes().size(), _group_counts.get(g.get_instance_id(), -1)])
+	return h
+
+
+func _link_settings(groups: Array[OctaImpostorGroup]) -> void:
+	var keep: Array[OctaBakeSettings] = []
+	for g in groups:
+		if g.settings != null:
+			keep.append(g.settings)
+			if not g.settings.changed.is_connected(_invalidate_group_info):
+				g.settings.changed.connect(_invalidate_group_info)
+	var old := _settings_links
+	_settings_links = keep
+	for s in old:
+		if is_instance_valid(s) and not keep.has(s) and s.changed.is_connected(_invalidate_group_info):
+			s.changed.disconnect(_invalidate_group_info)
+
+
+func _invalidate_group_info() -> void:
+	_group_key = 0
+	_queue_refresh()
 
 
 func _atlas_text(a: OctaAtlas) -> String:
@@ -234,9 +309,16 @@ func _atlas_text(a: OctaAtlas) -> String:
 		maps.append("back layer")
 	var w := a.albedo.get_width() if a.albedo else 0
 	var h := a.albedo.get_height() if a.albedo else 0
-	return "%s\nFormat version %d, %d object(s), %dx%d atlas, %d px per view, %d views each\nMaps: %s\nHalf-res material maps: %s\nWrite depth: %s, shadow views: %d, precise search: %s\nAbout %.0f MB of video memory before compression" % [
+	return "%s\nFormat version %d, %d object(s), %dx%d atlas, %d px per view, %d views each\nMaps: %s\nHalf-res material maps: %s\nWrite depth: %s, shadow views: %d, precise search: %s\nWind: %s\nAbout %.0f MB of video memory before compression" % [
 		a.resource_path.get_file() if not a.resource_path.is_empty() else "(not saved)", a.format_version, a.object_count(), w, h, a.frame_resolution, a.grid_size * a.grid_size,
-		", ".join(maps), "yes" if a.has_half_res_maps() else "no", "on" if a.write_depth else "off", a.shadow_views, "on" if a.precise_search else "off", a.vram_bytes() / 1048576.0]
+		", ".join(maps), "yes" if a.has_half_res_maps() else "no", "on" if a.write_depth else "off", a.shadow_views, "on" if a.precise_search else "off", _wind_text(a), a.vram_bytes() / 1048576.0]
+
+
+func _wind_text(a: OctaAtlas) -> String:
+	if not a.wind_active():
+		return "off (normal shader)"
+	var n := a.wind_counts()
+	return "on (wind shader), %d card(s), %d joined group(s)" % [n.x, n.y]
 
 
 # --- Batch edits ---
@@ -285,6 +367,10 @@ func _apply_fade() -> void:
 	_set_all({fade = _fade.selected, fade_margin = _fade_margin.value}, "Set Impostor Fade")
 
 
+func _apply_fade_mesh() -> void:
+	_set_all({fade_real_mesh = _fade_mesh.button_pressed}, "Set Impostor Real Mesh Fade")
+
+
 func _apply_depth() -> void:
 	_set_atlases("write_depth", _depth.button_pressed, "Set Impostor Depth Writing")
 
@@ -297,15 +383,20 @@ func _apply_shadow_views() -> void:
 	_set_atlases("shadow_views", int(_shadow_views.value), "Set Impostor Shadow Views")
 
 
+func _apply_wind() -> void:
+	_set_all({wind_strength = _wind.value}, "Set Impostor Wind")
+
+
 func _set_atlases(prop: String, value: Variant, action: String) -> void:
+	var cards := _cards()
 	var atlases: Array[OctaAtlas] = []
-	for c in _cards():
+	for c in cards:
 		if c is OctaImpostor and c.atlas != null and not atlases.has(c.atlas):
 			atlases.append(c.atlas)
 	if atlases.is_empty():
 		return
 	var ur: EditorUndoRedoManager = _plugin.get_undo_redo()
-	ur.create_action(action, UndoRedo.MERGE_DISABLE, _cards()[0])
+	ur.create_action(action, UndoRedo.MERGE_DISABLE, cards[0])
 	for a in atlases:
 		ur.add_do_property(a, prop, value)
 		ur.add_do_method(self, "_save_atlas", a)
@@ -343,6 +434,10 @@ func _edit_shared() -> void:
 
 func _join() -> void:
 	_plugin.join_cards(_cards())
+
+
+func _pack() -> void:
+	_plugin.pack_atlases(_cards())
 
 
 func _rebake() -> void:

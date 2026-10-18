@@ -123,19 +123,19 @@ static func _make_view(rig: Node) -> Dictionary:
 static func _compare(a: Image, b: Image) -> Dictionary:
 	a.convert(Image.FORMAT_RGBA8)
 	b.convert(Image.FORMAT_RGBA8)
+	var da := a.get_data()
+	var db := b.get_data()
 	var inter := 0
 	var uni := 0
 	var bad := 0
-	for y in SIZE:
-		for x in SIZE:
-			var ca := a.get_pixel(x, y)
-			var cb := b.get_pixel(x, y)
-			var ia := ca.a > 0.5
-			var ib := cb.a > 0.5
-			if ia or ib:
-				uni += 1
-			if ia and ib:
-				inter += 1
-				if (absf(ca.r - cb.r) + absf(ca.g - cb.g) + absf(ca.b - cb.b)) / 3.0 > 0.15:
-					bad += 1
+	for i in range(0, da.size(), 4):
+		var ia: bool = da[i + 3] > 127
+		var ib: bool = db[i + 3] > 127
+		if ia or ib:
+			uni += 1
+		if ia and ib:
+			inter += 1
+			var d := (absi(da[i] - db[i]) + absi(da[i + 1] - db[i + 1]) + absi(da[i + 2] - db[i + 2])) / 3.0
+			if d > 38.25:
+				bad += 1
 	return {iou = float(inter) / maxf(uni, 1), bad = float(bad + uni - inter) / maxf(uni, 1)}

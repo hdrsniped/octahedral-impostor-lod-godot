@@ -57,10 +57,13 @@ func _undo() -> void:
 	await get_tree().process_frame
 
 
-func _preset_flat(p: OctaBakeSettings.Preset) -> bool:
-	var s := OctaBakeSettings.new()
-	s.apply_preset(p)
-	return not s.write_depth and s.fade == OctaLOD.Fade.NONE
+func _hint_rows(n: Node) -> int:
+	var count := 0
+	for c in n.get_children():
+		if c is EditorProperty and not (c as Control).tooltip_text.is_empty():
+			count += 1
+		count += _hint_rows(c)
+	return count
 
 
 func _cards(n: String) -> int:
@@ -109,7 +112,7 @@ func _run() -> void:
 	await _undo()
 	_check(card.quality == OctaAtlas.Quality.HIGH and card.material_override.shader == OctaAtlas.SHADERS[OctaAtlas.Quality.HIGH], "undo restores the quality")
 	var ps := OctaBakeSettings.new()
-	ps.apply_preset(OctaBakeSettings.Preset.COMPLEX_SHAPES)
+	ps.apply_preset(OctaBakeSettings.Preset.MAX)
 	var preset_ui: OptionButton = _find(dialog, func(n: Node) -> bool: return n is OptionButton)
 	_check(preset_ui != null and ps.quality == OctaAtlas.Quality.ULTRA and ps.split_parts and ps.back_layer, "presets exist in the dialog and fill the settings")
 	_check(DirAccess.get_files_at("res://octa_impostors").size() == 1, "one atlas file saved: %s" % [DirAccess.get_files_at("res://octa_impostors")])
@@ -236,6 +239,41 @@ func _run() -> void:
 	await _undo()
 	_check(_root.get_node_or_null("OctaJoined_1") == null and _root.get_node_or_null("Ring_OctaImpostor") != null and ring_node.visible, "undo of join restores the cards and the real objects")
 
+	var props := settings.get_property_list().filter(func(d: Dictionary) -> bool: return d.name.begins_with("join_"))
+	_check(props.any(func(d: Dictionary) -> bool: return d.name == "join_adaptive") and props.any(func(d: Dictionary) -> bool: return d.name == "join_region_size") and props.any(func(d: Dictionary) -> bool: return d.name == "join_region_count"), "dialog settings list the adaptive join, region size and region count")
+	var join_before := [settings.join_cell, settings.join_adaptive, settings.join_region_size, settings.join_region_count]
+	settings.join_cell = 500.0
+	settings.join_region_size = 4.0
+	settings.join_region_count = 4
+	var spread: Array = []
+	for k in 8:
+		var sc := base_card.atlas.create_card(base_card.object_index, base_card.quality)
+		sc.name = "Spread%d_OctaImpostor" % k
+		sc.position = Vector3(0.0, 0.0, 40.0) + Vector3(float(k % 4) * 1.0 + (0.0 if k < 4 else 20.0), 0.0, float(k / 2)) * 1.0
+		_root.add_child(sc)
+		sc.owner = _root
+		spread.append(sc)
+	settings.join_adaptive = true
+	plug.join_cards(spread)
+	await get_tree().process_frame
+	var regions := _root.get_children().filter(func(n: Node) -> bool: return n is MultiMeshInstance3D and n.name.begins_with("OctaJoined"))
+	var sizes := regions.map(func(m: MultiMeshInstance3D) -> int: return m.multimesh.instance_count)
+	_check(regions.size() == 2 and sizes == [4, 4] and spread.all(func(c: Node) -> bool: return c.get_parent() == null), "adaptive join splits two clusters 20 m apart into two MultiMeshes of 4 and removes the cards (%s)" % [sizes])
+	await _undo()
+	_check(_root.get_children().filter(func(n: Node) -> bool: return n is MultiMeshInstance3D and n.name.begins_with("OctaJoined")).is_empty() and spread.all(func(c: Node) -> bool: return c.get_parent() == _root), "undo of the adaptive join restores the cards")
+	settings.join_adaptive = false
+	plug.join_cards(spread)
+	await get_tree().process_frame
+	regions = _root.get_children().filter(func(n: Node) -> bool: return n is MultiMeshInstance3D and n.name.begins_with("OctaJoined"))
+	_check(regions.size() == 1 and regions[0].multimesh.instance_count == 8, "adaptive off: the same cards join into one MultiMesh as before")
+	await _undo()
+	for c: Node in spread:
+		c.free()
+	settings.join_cell = join_before[0]
+	settings.join_adaptive = join_before[1]
+	settings.join_region_size = join_before[2]
+	settings.join_region_count = join_before[3]
+
 	var crate := MeshInstance3D.new()
 	crate.name = "Crate"
 	crate.mesh = BoxMesh.new()
@@ -285,6 +323,15 @@ func _run() -> void:
 	_check(lc.visibility_range_fade_mode == GeometryInstance3D.VISIBILITY_RANGE_FADE_DISABLED and lc.fade == OctaLOD.Fade.NONE, "dock turns the fade off")
 	await _undo()
 	_check(lc.visibility_range_fade_mode == GeometryInstance3D.VISIBILITY_RANGE_FADE_SELF, "undo restores the fade")
+	_check(OctaBakeSettings.new().fade_real_mesh and lc.fade_real_mesh and dock._fade_mesh.button_pressed, "fade real mesh defaults to on and the dock shows it")
+	dock._fade_mesh.button_pressed = false
+	dock._apply_fade_mesh()
+	_check(not lc.fade_real_mesh, "dock turns the real mesh fade off")
+	await _undo()
+	_check(lc.fade_real_mesh, "undo restores the real mesh fade")
+	_check(OctaLOD.card_overrides(lc).is_empty() or not OctaLOD.card_overrides(lc).has("fade_real_mesh"), "an unchanged real mesh fade is not recorded as an override")
+	_check(OctaLOD.fade_available() and OctaLOD.fade_kind() == ("native" if OctaLOD.fade_supported() else "dither"), "fade is available on the editor renderer (%s)" % OctaLOD.fade_kind())
+	_check(OctaLOD.fade_supported() == (lc.atlas.get_material(lc.quality).shader.code.find("CARD_FADE") < 0) and not OctaMeshFade.is_faded(mesh) or not OctaLOD.fade_supported(), "native renderers leave the card shader and the real mesh materials alone")
 	dock._depth.button_pressed = true
 	dock._apply_depth()
 	_check(lc.atlas.write_depth and lc.atlas.get_material(lc.quality).shader == OctaAtlas.SHADERS[lc.quality], "dock turns depth writing back on")
@@ -307,6 +354,14 @@ func _run() -> void:
 	_check(lc.atlas.precise_search and lc.atlas.get_material(ultra).shader.code.contains("PRECISE_SEARCH") and lc.atlas.get_material(lc.quality).shader.code.contains("NO_DEPTH_WRITE"), "dock turns precise search on for the atlas")
 	await _undo()
 	_check(not lc.atlas.precise_search and not lc.atlas.get_material(ultra).shader.code.contains("PRECISE_SEARCH"), "undo restores the normal Ultra shader")
+	_check(OctaBakeSettings.new().wind_strength == 0.0 and lc.wind_strength == 0.0 and dock._wind.value == 0.0 and lc.atlas.get_material(lc.quality).shader.code.find("CARD_WIND") < 0, "wind is off by default and the atlas keeps the normal shader")
+	dock._wind.value = 0.4
+	dock._apply_wind()
+	_check(is_equal_approx(lc.wind_strength, 0.4) and is_equal_approx(lc.get_instance_shader_parameter("card_wind"), 0.4) and lc.atlas.get_material(lc.quality).shader.code.contains("CARD_WIND"), "dock wind row sets the strength, the instance uniform and the wind shader variant")
+	_check(dock._atlas_text(lc.atlas).contains("Wind: on (wind shader), 1 card(s), 0 joined group(s)"), "dock atlas info lists the wind variant and how many cards use it")
+	await _undo()
+	_check(lc.wind_strength == 0.0 and lc.atlas.get_material(lc.quality).shader.code.find("CARD_WIND") < 0, "undo restores strength 0 and the normal shader")
+	_check(dock._atlas_text(lc.atlas).contains("Wind: off (normal shader)"), "dock atlas info lists wind as off when no card uses it")
 	settings.quality = ultra
 	settings.precise_search = true
 	await _select(["Ball"])
@@ -337,7 +392,11 @@ func _run() -> void:
 	settings.lod_mode = OctaLOD.LodMode.DISTANCE
 	settings.fade = OctaLOD.Fade.NONE
 	settings.write_depth = true
-	_check(OctaBakeSettings.new().write_depth and not _preset_flat(OctaBakeSettings.Preset.BALANCED) and _preset_flat(OctaBakeSettings.Preset.MOBILE), "presets: mobile has flat depth, others keep depth")
+	var min_pin := OctaBakeSettings.new()
+	min_pin.apply_preset(OctaBakeSettings.Preset.MINIMAL)
+	var fast_pin := OctaBakeSettings.new()
+	fast_pin.apply_preset(OctaBakeSettings.Preset.FAST)
+	_check(OctaBakeSettings.new().write_depth and not min_pin.write_depth and fast_pin.write_depth, "presets: Minimal has flat depth, the others keep depth")
 
 	var ro: OctaImpostor = _root.get_node("Ring_OctaImpostor")
 	ro.tint = Color(1.0, 0.2, 0.2)
@@ -393,6 +452,14 @@ func _run() -> void:
 	await _undo()
 	_check(_root.get_node_or_null("Props/PropA_OctaImpostor") == null and _root.get_node_or_null("Props/PropB_OctaImpostor") == null and grp.atlas == null and _root.get_node("Props/PropA").visibility_parent.is_empty(), "undo of a group bake removes the cards and clears the group atlas")
 
+	grp.chunk_lod_distance = 30.0
+	_check(await plug.bake_group(grp) and grp.chunk_card() != null, "a group with a chunk distance also bakes one chunk card")
+	var chunk_prop: OctaImpostor = _root.get_node("Props/PropA_OctaImpostor")
+	_check(grp.chunk_atlas != null and grp.chunk_atlas.resource_path.contains("_chunk") and is_equal_approx(grp.chunk_card().visibility_range_begin, 30.0) and is_equal_approx(chunk_prop.visibility_range_end, 30.0), "the chunk card starts where the object cards stop (30 m)")
+	await _undo()
+	_check(grp.chunk_card() == null and _root.get_node_or_null("Props/PropA_OctaImpostor") == null, "undo removes the chunk card too")
+	grp.chunk_lod_distance = 0.0
+
 	_check(await plug.bake_group(grp) and grp.atlas != null, "Bake Group works again after undo")
 	var group_atlas_1 := grp.atlas
 	pa_card = _root.get_node("Props/PropA_OctaImpostor")
@@ -419,7 +486,7 @@ func _run() -> void:
 	dock.refresh()
 	_check(dock._group_info.text.contains("Props") and dock._group_info.text.contains("2 object") and dock._cards().size() == 2 and not dock._group_buttons[0].disabled, "dock shows the selected group and its cards")
 	var gi: String = dock._info.text
-	_check(gi.contains("Format version 4") and gi.contains("Maps: albedo, normal+depth") and gi.contains("Half-res material maps: ") and gi.contains("Write depth: on") and gi.contains("shadow views: 1") and gi.contains("precise search: off") and gi.contains("MB of video memory"), "dock atlas info lists format, maps, half-res, depth, shadow views, precise search and VRAM")
+	_check(gi.contains("Format version 4") and gi.contains("Maps: albedo, normal+depth") and gi.contains("Half-res material maps: ") and gi.contains("Write depth: on") and gi.contains("shadow views: 1") and gi.contains("precise search: off") and gi.contains("Wind: off") and gi.contains("MB of video memory"), "dock atlas info lists format, maps, half-res, depth, shadow views, precise search, wind and VRAM")
 	await _select(["Ball"])
 	dock.refresh()
 	_check(dock._group_buttons[0].disabled, "dock group buttons are disabled when no group is selected")
@@ -534,25 +601,52 @@ func _options_checks(dock: Object, plug: Object, dialog: ConfirmationDialog, set
 		help.hide()
 
 	var presets := {}
-	for p in [OctaBakeSettings.Preset.MOBILE, OctaBakeSettings.Preset.BALANCED, OctaBakeSettings.Preset.HIGH_QUALITY, OctaBakeSettings.Preset.COMPLEX_SHAPES]:
+	for p in [OctaBakeSettings.Preset.MINIMAL, OctaBakeSettings.Preset.FAST, OctaBakeSettings.Preset.QUALITY, OctaBakeSettings.Preset.MAX]:
 		var s := OctaBakeSettings.new()
 		s.precise_search = true
 		s.shadow_views = 3
 		s.half_res_material_maps = not s.half_res_material_maps
-		s.write_depth = not p == OctaBakeSettings.Preset.MOBILE
-		s.fade = OctaLOD.Fade.CROSSFADE if p != OctaBakeSettings.Preset.HIGH_QUALITY else OctaLOD.Fade.NONE
+		s.write_depth = p != OctaBakeSettings.Preset.MINIMAL
+		s.hemisphere = false
+		s.fade = OctaLOD.Fade.NONE
 		s.apply_preset(p)
 		presets[p] = s
-	var mo: OctaBakeSettings = presets[OctaBakeSettings.Preset.MOBILE]
-	var ba: OctaBakeSettings = presets[OctaBakeSettings.Preset.BALANCED]
-	var hq: OctaBakeSettings = presets[OctaBakeSettings.Preset.HIGH_QUALITY]
-	var cs: OctaBakeSettings = presets[OctaBakeSettings.Preset.COMPLEX_SHAPES]
-	_check(not mo.write_depth and mo.half_res_material_maps and mo.shadow_views == 1 and not mo.precise_search and mo.fade == OctaLOD.Fade.NONE, "Mobile preset: flat depth, half-res maps, 1 shadow view, no precise search, no fade")
-	_check(ba.write_depth and ba.half_res_material_maps and ba.shadow_views == 1 and not ba.precise_search and ba.fade == OctaLOD.Fade.NONE, "Balanced preset: depth, half-res maps, 1 shadow view, no precise search, no fade")
-	_check(hq.write_depth and not hq.half_res_material_maps and hq.shadow_views == 2 and not hq.precise_search and hq.fade == OctaLOD.Fade.CROSSFADE, "High quality preset: depth, full-res maps, 2 shadow views, crossfade")
-	_check(cs.write_depth and cs.half_res_material_maps and cs.shadow_views == 1 and not cs.precise_search and cs.fade == OctaLOD.Fade.NONE and cs.quality == OctaAtlas.Quality.ULTRA and cs.split_parts and cs.back_layer and cs.search_steps == 12, "Complex shapes preset: Ultra, split parts, back layer, 12 steps, precise search left off")
+	var mn: OctaBakeSettings = presets[OctaBakeSettings.Preset.MINIMAL]
+	var fa: OctaBakeSettings = presets[OctaBakeSettings.Preset.FAST]
+	var qu: OctaBakeSettings = presets[OctaBakeSettings.Preset.QUALITY]
+	var mx: OctaBakeSettings = presets[OctaBakeSettings.Preset.MAX]
+	_check(mn.quality == OctaAtlas.Quality.LOW and mn.max_atlas_size == 1024 and not mn.write_depth and not mn.material_maps and not mn.emission and mn.shadow_views == 1 and not mn.precise_search and mn.fade == OctaLOD.Fade.CROSSFADE, "Minimal preset: Low, 1024, flat depth, no material maps, 1 shadow view, crossfade")
+	_check(fa.quality == OctaAtlas.Quality.HIGH and fa.max_atlas_size == 2048 and fa.grid_size == 10 and fa.write_depth and fa.half_res_material_maps and fa.shadow_views == 1 and not fa.precise_search, "Fast preset: High, 2048, 10x10 views, depth, half-res maps, 1 shadow view")
+	_check(qu.quality == OctaAtlas.Quality.HIGH and qu.max_atlas_size == 4096 and qu.grid_size == 16 and not qu.half_res_material_maps and qu.shadow_views == 2 and not qu.precise_search and not qu.split_parts, "Quality preset: High, 4096, 16x16 views, full-res maps, 2 shadow views")
+	_check(mx.quality == OctaAtlas.Quality.ULTRA and mx.max_atlas_size == 4096 and mx.split_parts and mx.back_layer and mx.precise_search and mx.search_steps == 24 and mx.shadow_views == 3 and mx.hemisphere and not mx.half_res_material_maps and mx.msaa == Viewport.MSAA_8X, "Max preset: Ultra, precise, split parts, back layer, 24 steps, 3 shadow views, 8x MSAA, hemisphere on")
 	var preset_ui: OptionButton = _find(dialog, func(n: Node) -> bool: return n is OptionButton)
 	_check(OctaBakeSettings.PRESET_TIPS.size() == OctaBakeSettings.PRESET_NAMES.size() and preset_ui.item_count == OctaBakeSettings.PRESET_NAMES.size() and range(preset_ui.item_count).all(func(i: int) -> bool: return not preset_ui.get_item_tooltip(i).is_empty()), "every preset has a tooltip in the dialog")
+	var max_before := OctaBakeSettings.preset_values(OctaBakeSettings.Preset.MAX)
+	var probe := OctaBakeSettings.new()
+	probe.apply_preset(OctaBakeSettings.Preset.MAX)
+	probe.quality = OctaAtlas.Quality.LOW
+	probe.grid_size = 4
+	probe.shadow_views = 1
+	probe.apply_preset(OctaBakeSettings.Preset.MAX)
+	_check(probe.quality == OctaAtlas.Quality.ULTRA and probe.grid_size == 16 and probe.shadow_views == 3 and max_before == OctaBakeSettings.preset_values(OctaBakeSettings.Preset.MAX), "presets are constant: re-applying restores every value and the table never changes")
+	preset_ui.select(OctaBakeSettings.Preset.QUALITY)
+	var ins: EditorInspector = _find(dialog, func(n: Node) -> bool: return n is EditorInspector)
+	ins.property_edited.emit("quality")
+	_check(preset_ui.get_selected() == OctaBakeSettings.Preset.CUSTOM, "changing a setting a preset owns switches the dropdown to Custom")
+	preset_ui.select(OctaBakeSettings.Preset.QUALITY)
+	ins.property_edited.emit("lod_distance")
+	_check(preset_ui.get_selected() == OctaBakeSettings.Preset.QUALITY, "changing a placement setting the preset does not own keeps the preset")
+	await get_tree().process_frame
+	_check(OctaBakeSettings.SHORT_HINTS.size() >= 30 and _hint_rows(dialog) >= 30, "the bake dialog explains every setting on hover (%d rows)" % _hint_rows(dialog))
+	settings.apply_preset(OctaBakeSettings.Preset.FAST)
+	_check(plug._matching_preset() == OctaBakeSettings.Preset.FAST, "the preset matching the saved settings is selected again")
+	settings.grid_size = 7
+	_check(plug._matching_preset() == OctaBakeSettings.Preset.CUSTOM, "edited preset settings read as Custom")
+	settings.grid_size = 10
+	plug._save_settings()
+	settings.grid_size = 4
+	plug._load_settings()
+	_check(settings.grid_size == 10, "custom settings survive a save and a reload")
 
 	_check(dock._debug.item_count == OctaDebug.Mode.size() and dock._debug.get_item_text(OctaDebug.Mode.OVERDRAW) == "Overdraw" and OctaDebug.mode_names().size() == OctaDebug.Mode.size(), "debug dropdown has an entry for every OctaDebug mode")
 	_check(_find(dock, func(n: Node) -> bool: return n is Button and n.text == "Re-bake All") != null and _find(dock, func(n: Node) -> bool: return n is Button and n.text == "Select All") != null, "dock has Re-bake All and Select All buttons")
@@ -594,3 +688,31 @@ func _options_checks(dock: Object, plug: Object, dialog: ConfirmationDialog, set
 	await _undo()
 	await _undo()
 	_check(_root.get_node("RebakeA_OctaImpostor") == ca and _root.get_node("RebakeB_OctaImpostor") == cb, "undo of Re-bake All restores the old cards")
+
+	var cg := OctaImpostorGroup.new()
+	cg.name = "ChunkProps"
+	_root.add_child(cg)
+	cg.owner = _root
+	for spec2 in [["ChunkA", BoxMesh.new(), Vector3(0, 0, 20)], ["ChunkB", SphereMesh.new(), Vector3(3, 0, 20)]]:
+		var cm := MeshInstance3D.new()
+		cm.name = spec2[0]
+		cm.mesh = spec2[1]
+		cm.position = spec2[2]
+		cg.add_child(cm)
+		cm.owner = _root
+	cg.settings.grid_size = 4
+	cg.settings.max_atlas_size = 256
+	cg.settings.lod_distance = 10.0
+	cg.chunk_lod_distance = 25.0
+	_check(await plug.bake_group(cg) and cg.chunk_card() != null, "bake a second group with a chunk card")
+	var chunk_a := cg.chunk_card()
+	await plug.rebake([chunk_a])
+	_check(cg.chunk_card() != null and cg.chunk_card() != chunk_a, "re-baking a chunk card replaces it")
+	var chunk_count := 0
+	for card in cg.cards():
+		if card.has_meta(OctaAtlas.CHUNK_META):
+			chunk_count += 1
+	_check(chunk_count == 1, "exactly one chunk card stays after re-baking it (%d)" % chunk_count)
+	_check(_root.get_node("ChunkProps/ChunkA").visibility_parent == NodePath("../ChunkA_OctaImpostor"), "re-baking a chunk card keeps the props linked to their own cards")
+	await _undo()
+	_check(cg.chunk_card() == chunk_a, "undo of the chunk re-bake restores the previous chunk card")

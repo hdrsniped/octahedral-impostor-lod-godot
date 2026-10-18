@@ -6,6 +6,8 @@ extends MeshInstance3D
 ## The baked atlas this card draws from.
 @export var atlas: OctaAtlas:
 	set(v):
+		if atlas != null and atlas != v:
+			atlas.set_wind_user(self, false)
 		atlas = v
 		_refresh()
 ## Which object of the atlas this card shows (0 = the first baked object).
@@ -38,16 +40,25 @@ extends MeshInstance3D
 	set(v):
 		screen_percent = maxf(v, 0.01)
 		_apply_lod()
-## Crossfade dithers between the real mesh and the card (Forward+ only, not for Replace mode).
+## Crossfade dithers the card in over the real mesh instead of popping. Works on every renderer:
+## Godot's own fade on Forward+, a screen-space dither in the card shader on Mobile and
+## Compatibility. Not for Replace mode.
 @export var fade := OctaLOD.Fade.NONE:
 	set(v):
 		fade = v
 		_apply_fade()
 		notify_property_list_changed()
-## Meters after the LOD distance over which the crossfade happens.
+## The crossfade runs from the LOD distance minus this margin to the LOD distance plus this margin.
 @export_range(0.0, 100.0, 0.5, "or_greater", "suffix:m") var fade_margin := 5.0:
 	set(v):
 		fade_margin = maxf(v, 0.0)
+		_apply_fade()
+## Mobile and Compatibility only: also dither the real mesh out across the same band (material
+## copies, your own materials stay untouched). Off, or for materials that cannot fade (shaders, own
+## distance fade), the card fades in over the real mesh and the mesh switches off behind it.
+@export var fade_real_mesh := true:
+	set(v):
+		fade_real_mesh = v
 		_apply_fade()
 
 @export_group("Per-card look")
@@ -61,6 +72,14 @@ extends MeshInstance3D
 	set(v):
 		depth_multiplier = v
 		set_instance_shader_parameter("card_depth", v)
+## Far-field wind sway of this card (0 = still, the default). At 1 the top of the object leans downwind
+## by 20% of its radius (more in gusts) while the base stays fixed. Done in texture space: no vertex
+## displacement and no bigger bounds. The first card above 0 switches its atlas to the wind shader
+## variant; with every card at 0 the atlas keeps the normal shader. Direction and speed: OctaWind.set_wind().
+@export_range(0.0, 1.0, 0.01) var wind_strength := 0.0:
+	set(v):
+		wind_strength = maxf(v, 0.0)
+		_apply_wind()
 
 @export_group("Tools")
 @export_tool_button("Check Quality", "Search") var check_quality_action := _check_quality
@@ -71,6 +90,22 @@ extends MeshInstance3D
 var _batch := false
 var _lod_distance := 0.0
 var _checking := false
+var _dithered := false
+var _meshes_faded := false
+var _winded := false
+
+static var _live := {}
+
+
+static func live_cards() -> Array[OctaImpostor]:
+	var out: Array[OctaImpostor] = []
+	for id: int in _live.keys():
+		var c: OctaImpostor = _live[id].get_ref()
+		if c == null:
+			_live.erase(id)
+		else:
+			out.append(c)
+	return out
 
 
 # --- Card setup ---
@@ -79,15 +114,34 @@ func _init() -> void:
 
 
 func _enter_tree() -> void:
+	_live[get_instance_id()] = weakref(self)
 	if lod_mode == OctaLOD.LodMode.DISTANCE:
 		visibility_range_begin = _lod_distance
 	if lod_mode == OctaLOD.LodMode.SCREEN_SIZE or fade != OctaLOD.Fade.NONE:
 		_apply_lod()
+	_refresh()
+	_apply_wind()
+
+
+func _ready() -> void:
+	if fade != OctaLOD.Fade.NONE:
+		_apply_fade.call_deferred()
 
 
 func _exit_tree() -> void:
+	_live.erase(get_instance_id())
 	_lod_distance = visibility_range_begin
 	_checking = false
+	if atlas != null:
+		atlas.set_wind_user(self, false)
+	_apply_real_mesh(false)
+
+
+func _notification(what: int) -> void:
+	if what == NOTIFICATION_EDITOR_PRE_SAVE:
+		_apply_real_mesh(false)
+	elif what == NOTIFICATION_EDITOR_POST_SAVE and fade != OctaLOD.Fade.NONE:
+		_apply_fade()
 
 
 func _validate_property(property: Dictionary) -> void:
@@ -95,16 +149,21 @@ func _validate_property(property: Dictionary) -> void:
 		property.usage |= PROPERTY_USAGE_READ_ONLY
 	elif property.name == "screen_percent" and lod_mode == OctaLOD.LodMode.DISTANCE:
 		property.usage = PROPERTY_USAGE_STORAGE
-	elif property.name == "fade_margin" and fade == OctaLOD.Fade.NONE:
+	elif (property.name == "fade_margin" or property.name == "fade_real_mesh") and fade == OctaLOD.Fade.NONE:
 		property.usage = PROPERTY_USAGE_STORAGE
 
 
 func _refresh() -> void:
+	if not is_inside_tree():
+		return
 	if atlas == null or object_index >= atlas.object_count():
 		return
 	mesh = atlas.get_mesh(object_index)
 	material_override = atlas.get_material(quality)
 	set_instance_shader_parameter("octa_index", object_index)
+	if fade != OctaLOD.Fade.NONE:
+		_apply_fade()
+	_apply_wind()
 
 
 # --- LOD and fade ---
@@ -114,6 +173,8 @@ func configure(s: OctaBakeSettings, world_scale: float) -> void:
 	screen_percent = s.lod_screen_percent
 	fade = s.fade
 	fade_margin = s.fade_margin
+	fade_real_mesh = s.fade_real_mesh
+	wind_strength = s.wind_strength
 	_batch = false
 	if get_meta(OctaLOD.MODE_META, OctaLOD.Mode.DYNAMIC_LOD) == OctaLOD.Mode.DYNAMIC_LOD:
 		if lod_mode == OctaLOD.LodMode.DISTANCE:
@@ -159,13 +220,57 @@ func _set_begin(distance: float) -> void:
 func _apply_fade() -> void:
 	if _batch:
 		return
-	var usable: bool = fade == OctaLOD.Fade.CROSSFADE and visibility_range_begin > 0.0 and OctaLOD.fade_supported() and get_meta(OctaLOD.MODE_META, OctaLOD.Mode.DYNAMIC_LOD) != OctaLOD.Mode.REPLACE
+	var usable: bool = fade == OctaLOD.Fade.CROSSFADE and visibility_range_begin > 0.0 and OctaLOD.fade_available() and get_meta(OctaLOD.MODE_META, OctaLOD.Mode.DYNAMIC_LOD) != OctaLOD.Mode.REPLACE
 	if usable:
 		visibility_range_fade_mode = GeometryInstance3D.VISIBILITY_RANGE_FADE_SELF
 		visibility_range_begin_margin = fade_margin
 	elif visibility_range_fade_mode != GeometryInstance3D.VISIBILITY_RANGE_FADE_DISABLED:
 		visibility_range_fade_mode = GeometryInstance3D.VISIBILITY_RANGE_FADE_DISABLED
 		visibility_range_begin_margin = 1.0
+	_apply_dither(usable)
+	_apply_real_mesh(usable and fade_real_mesh)
+
+
+func refresh_fade() -> void:
+	_apply_fade()
+
+
+func _apply_dither(usable: bool) -> void:
+	if usable and not OctaLOD.fade_supported() and atlas != null:
+		atlas.card_fade = true
+		set_instance_shader_parameter("card_fade", OctaLOD.fade_band(visibility_range_begin, fade_margin))
+		_dithered = true
+	elif _dithered:
+		set_instance_shader_parameter("card_fade", Vector2.ZERO)
+		_dithered = false
+
+
+# --- Wind ---
+func _apply_wind() -> void:
+	if wind_strength > 0.0 or _winded:
+		set_instance_shader_parameter("card_wind", wind_strength)
+		_winded = wind_strength > 0.0
+	if atlas != null and is_inside_tree():
+		atlas.set_wind_user(self, wind_strength > 0.0)
+
+
+func _apply_real_mesh(on: bool) -> void:
+	on = on and not OctaLOD.fade_supported()
+	if not on and not _meshes_faded:
+		return
+	var src := source()
+	if src == null:
+		return
+	var band := OctaLOD.fade_band(visibility_range_begin, fade_margin)
+	var any := false
+	for gi in OctaLOD.geometry_below(src):
+		if gi.visibility_parent.is_empty() or gi.get_node_or_null(gi.visibility_parent) != self:
+			continue
+		if on:
+			any = OctaMeshFade.apply(gi, band) > 0 or any
+		else:
+			OctaMeshFade.restore(gi)
+	_meshes_faded = any
 
 
 func source() -> Node3D:

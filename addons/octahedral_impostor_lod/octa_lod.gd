@@ -20,6 +20,8 @@ enum Fade {
 
 const DEFAULT_FOV := 75.0
 const FOV_SETTING := "octa_lod/reference_fov"
+
+static var _fade_cache := -1
 const SOURCE_META := &"octa_source"
 const MODE_META := &"octa_mode"
 
@@ -60,6 +62,7 @@ static func attach_card(source: Node3D, atlas: OctaAtlas, index: int, mode := Mo
 			card.visibility_range_begin_margin = 1.0
 		for gi in geometry_below(source):
 			gi.visibility_parent = gi.get_path_to(card)
+		card.refresh_fade()
 	elif mode == Mode.REPLACE:
 		source.visible = false
 	if owner != null:
@@ -97,12 +100,56 @@ static func _gather_candidates(node: Node, lod: float, out: Array, claimed: Dict
 		if geo.is_empty():
 			_gather_candidates(c, lod, out, claimed, use_groups)
 			continue
-		var radius: float = OctaBaker._collect(c).bounds.w
+		var radius := candidate_radius(c)
 		var tris := 0
-		for g in geo:
-			tris += g.mesh.get_faces().size() / 3
+		for g: MeshInstance3D in geo:
+			tris += triangle_count(g.mesh)
 		var pct := screen_size_for_distance(radius, lod)
 		out.append({node = c, pct = pct, tris = tris, cards = find_cards(c).size()})
+
+
+static func candidate_radius(node: Node3D) -> float:
+	var corners: Array[Vector3] = []
+	_candidate_corners(node, Transform3D.IDENTITY, true, corners)
+	if corners.is_empty():
+		return OctaBaker.MIN_RADIUS
+	var lo := corners[0]
+	var hi := corners[0]
+	for p in corners:
+		lo = lo.min(p)
+		hi = hi.max(p)
+	var c := (lo + hi) * 0.5
+	var r2 := 0.0
+	for p in corners:
+		r2 = maxf(r2, c.distance_squared_to(p))
+	return maxf(sqrt(r2), OctaBaker.MIN_RADIUS)
+
+
+static func _candidate_corners(node: Node, xform: Transform3D, is_root: bool, out: Array[Vector3]) -> void:
+	if node.has_meta(OctaAtlas.CARD_META):
+		return
+	if node is Node3D:
+		if not node.visible:
+			return
+		if not is_root:
+			xform = xform * (node as Node3D).transform
+	if node is MeshInstance3D and (node as MeshInstance3D).mesh != null:
+		var box: AABB = (node as MeshInstance3D).mesh.get_aabb()
+		for i in 8:
+			out.append(xform * (box.position + box.size * Vector3(float(i & 1), float((i >> 1) & 1), float((i >> 2) & 1))))
+	for child in node.get_children():
+		_candidate_corners(child, xform, false, out)
+
+
+static func triangle_count(mesh: Mesh) -> int:
+	if mesh is ArrayMesh:
+		var am := mesh as ArrayMesh
+		var n := 0
+		for s in am.get_surface_count():
+			var indices := am.surface_get_array_index_len(s)
+			n += (indices if indices > 0 else am.surface_get_array_len(s)) / 3
+		return n
+	return mesh.get_faces().size() / 3
 
 
 static func split_parts(sources: Array) -> Array[Node3D]:
@@ -123,12 +170,21 @@ static func remove_cards(source: Node3D) -> void:
 
 
 static func find_cards_below(source: Node) -> Array[Node3D]:
-	var out := find_cards(source)
-	for gi in geometry_below(source):
-		if gi != source:
-			for c in find_cards(gi):
-				if not out.has(c):
-					out.append(c)
+	var found := {}
+	for c in find_cards(source):
+		found[c] = true
+	var stack: Array[Node] = [source]
+	while not stack.is_empty():
+		var n: Node = stack.pop_back()
+		if n != source and n.has_meta(OctaAtlas.CARD_META):
+			if n.get_node_or_null(n.get_meta(SOURCE_META, NodePath(".."))) != null:
+				found[n] = true
+			continue
+		for child in n.get_children():
+			stack.append(child)
+	var out: Array[Node3D] = []
+	for n in found:
+		out.append(n)
 	return out
 
 
@@ -162,20 +218,24 @@ static func card_overrides(card: Node) -> Dictionary:
 		out.fade = card.fade
 	if not is_equal_approx(card.fade_margin, base.fade_margin):
 		out.fade_margin = card.fade_margin
+	if card.fade_real_mesh != base.fade_real_mesh:
+		out.fade_real_mesh = card.fade_real_mesh
 	if card.tint != Color.WHITE:
 		out.tint = card.tint
 	if not is_equal_approx(card.depth_multiplier, 1.0):
 		out.depth_multiplier = card.depth_multiplier
+	if not is_equal_approx(card.wind_strength, base.wind_strength):
+		out.wind_strength = card.wind_strength
 	return out
 
 
 static func apply_overrides(card: OctaImpostor, overrides: Dictionary) -> void:
-	for p: String in ["lod_mode", "screen_percent", "fade", "fade_margin"]:
+	for p: String in ["lod_mode", "screen_percent", "fade", "fade_margin", "fade_real_mesh"]:
 		if overrides.has(p):
 			card.set(p, overrides[p])
 	if overrides.has("lod_distance") and card.lod_mode == LodMode.DISTANCE:
 		card.lod_distance = overrides.lod_distance
-	for p: String in ["quality", "tint", "depth_multiplier"]:
+	for p: String in ["quality", "tint", "depth_multiplier", "wind_strength"]:
 		if overrides.has(p):
 			card.set(p, overrides[p])
 
@@ -211,8 +271,22 @@ static func world_scale(node: Node) -> float:
 
 
 static func fade_supported() -> bool:
-	var method := String(ProjectSettings.get_setting("rendering/renderer/rendering_method", "forward_plus")) if Engine.is_editor_hint() else RenderingServer.get_current_rendering_method()
-	return method == "forward_plus"
+	if _fade_cache < 0:
+		var method := String(ProjectSettings.get_setting("rendering/renderer/rendering_method", "forward_plus")) if Engine.is_editor_hint() else RenderingServer.get_current_rendering_method()
+		_fade_cache = 1 if method == "forward_plus" else 0
+	return _fade_cache == 1
+
+
+static func fade_available() -> bool:
+	return true
+
+
+static func fade_kind() -> String:
+	return "native" if fade_supported() else "dither"
+
+
+static func fade_band(distance: float, margin: float) -> Vector2:
+	return Vector2(maxf(distance - margin, 0.0), distance + margin)
 
 
 # --- Helpers ---
@@ -234,6 +308,7 @@ static func geometry_below(node: Node) -> Array[GeometryInstance3D]:
 static func _restore(source: Node3D, card: Node) -> void:
 	for gi in geometry_below(source):
 		if gi.get_node_or_null(gi.visibility_parent) == card:
+			OctaMeshFade.restore(gi)
 			gi.visibility_parent = NodePath()
 	if card.get_meta(MODE_META, Mode.DYNAMIC_LOD) == Mode.REPLACE:
 		source.visible = true
