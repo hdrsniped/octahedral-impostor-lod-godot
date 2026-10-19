@@ -71,7 +71,7 @@ static func bake(sources: Array, host: Node, settings: OctaBakeSettings = null, 
 	atlas.parallax_refine = settings.parallax_refine
 	atlas.shadow_views = settings.shadow_views
 	atlas.grid_size = n
-	atlas.hemisphere = settings.hemisphere
+	atlas.hemisphere = not settings.full_sphere
 	atlas.parent_space = settings.split_parts
 	atlas.tiles = Vector2i(l.cols, l.rows)
 	atlas.frame_resolution = fr
@@ -150,7 +150,7 @@ static func bake(sources: Array, host: Node, settings: OctaBakeSettings = null, 
 				batch = mini(batch, maxi(job.max_views, 1))
 				job.last_batch = batch
 			for j in batch:
-				var d := OctaAtlas.frame_dir(Vector2i((f + j) % n, (f + j) / n), n, settings.hemisphere)
+				var d := OctaAtlas.frame_dir(Vector2i((f + j) % n, (f + j) / n), n, not settings.full_sphere)
 				var set_vps: Array[SubViewport] = [vps_a[j], vps_n[j]]
 				if not vps_b.is_empty():
 					set_vps.append(vps_b[j])

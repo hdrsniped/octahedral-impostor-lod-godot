@@ -4,6 +4,7 @@ extends VBoxContainer
 var _plugin
 var _selection: Label
 var _info: Label
+var _atlas_summary: Label
 var _quality: OptionButton
 var _lod: SpinBox
 var _lod_mode: OptionButton
@@ -16,12 +17,14 @@ var _shadow_views: SpinBox
 var _wind: SpinBox
 var _debug: OptionButton
 var _group_info: Label
+var _group_summary: Label
 var _group_buttons: Array[Button] = []
 var _batch: Array[Control] = []
 var _joins: Array[Button] = []
 var _refresh_pending := false
 var _group_key := 0
 var _group_text := ""
+var _group_summary_line := ""
 var _group_counts := {}
 var _settings_links: Array[OctaBakeSettings] = []
 
@@ -43,11 +46,11 @@ func _init(plugin: EditorPlugin) -> void:
 	actions.add_child(_button("Check Quality", "Compare the impostors with the real meshes from 8 angles.", _plugin._check))
 	actions.add_child(_button("Bake Scene...", "Pick objects from the whole scene to bake with a checklist.", _plugin.open_scene_picker))
 	actions.add_child(_button("Remove", "Remove the impostors of the selected objects (undoable).", _plugin._remove))
-	var join := _button("Join", "Merge the selected impostors that are close together into one draw call per group (undoable). Join Cell, Adaptive Join and the region limits are in the bake dialog. Their real meshes are hidden.", _join)
+	var join := _button("Join", "Merge the selected cards of the same object into one draw call per group (undoable).", _join)
 	actions.add_child(join)
 	var rebake := _button("Re-bake", "Bake the selected impostors again with their saved settings.", _rebake)
 	actions.add_child(rebake)
-	actions.add_child(_button("Pack Atlases", "Merge the atlases of the selected impostors into shared ones without re-baking, so their cards share one material and can be joined (undoable). Atlases must agree on grid size, view size, padding and atlas options.", _pack))
+	actions.add_child(_button("Pack Atlases", "Merge the selected cards' atlases into shared ones without re-baking (undoable).", _pack))
 	_joins = [join, rebake]
 	actions.add_child(_button("Select Impostors", "Select the impostor cards of the selected objects.", _select_cards))
 	actions.add_child(_button("Select Sources", "Select the real objects of the selected cards.", _select_sources))
@@ -64,6 +67,8 @@ func _init(plugin: EditorPlugin) -> void:
 	group_row.add_child(_button("Re-bake Group", "Bake the selected group again with its settings; properties you changed on its cards are kept (undoable).", _plugin.bake_selected_groups.bind(true)))
 	_group_buttons.assign(group_row.get_children())
 	add_child(group_row)
+	_group_summary = _label()
+	add_child(_group_summary)
 
 	add_child(HSeparator.new())
 	add_child(_heading("Selected impostors"))
@@ -158,6 +163,8 @@ func _init(plugin: EditorPlugin) -> void:
 
 	add_child(HSeparator.new())
 	add_child(_heading("Atlas"))
+	_atlas_summary = _label()
+	add_child(_atlas_summary)
 	_info = _label()
 	add_child(_info)
 	EditorInterface.get_selection().selection_changed.connect(_queue_refresh)
@@ -188,6 +195,15 @@ func _button(text: String, tip: String, action: Callable) -> Button:
 
 func _exit_tree() -> void:
 	OctaDebug.set_mode(OctaDebug.Mode.OFF)
+
+
+# --- Scrolling ---
+func _ready() -> void:
+	var scroll := get_parent() as ScrollContainer
+	if scroll != null:
+		scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+		scroll.vertical_scroll_mode = ScrollContainer.SCROLL_MODE_SHOW_ALWAYS
+		scroll.follow_focus = true
 
 
 # --- State ---
@@ -240,6 +256,9 @@ func refresh() -> void:
 		if c is OctaImpostor and c.atlas != null:
 			card = c
 			break
+	var summary := _atlas_summary_text(_selected_atlases(cards))
+	_atlas_summary.text = summary
+	_atlas_summary.visible = not summary.is_empty()
 	if card == null:
 		_info.text = "Select a baked object or a card to see its atlas." if cards.is_empty() else "These cards were made with v1.0. Re-bake them to edit them here."
 		return
@@ -259,14 +278,31 @@ func refresh() -> void:
 
 func _group_info_text(groups: Array[OctaImpostorGroup]) -> String:
 	_link_settings(groups)
+	_group_summary.visible = not groups.is_empty()
 	if groups.is_empty():
 		_group_key = 0
+		_group_text = ""
+		_group_summary_line = ""
+		_group_summary.text = ""
 		return "No group selected. Add an OctaImpostorGroup node to bake objects with shared settings, then select it here."
 	var key := _group_signature(groups)
 	if key != _group_key:
 		_group_key = key
-		_group_text = "\n".join(groups.map(func(g: OctaImpostorGroup) -> String: return g.info()))
+		_group_text = "\n".join(groups.map(func(g: OctaImpostorGroup) -> String: return "Group %s: %d object(s), %d card(s) baked." % [g.name, g.target_nodes().size(), g.cards().size()]))
+		_group_summary_line = _group_summary_text(groups)
+	_group_summary.text = _group_summary_line
 	return _group_text
+
+
+func _group_summary_text(groups: Array[OctaImpostorGroup]) -> String:
+	var lines := PackedStringArray()
+	for i in mini(groups.size(), 2):
+		var g := groups[i]
+		var nodes := g.target_nodes()
+		lines.append("%s: %s" % [g.name, g.effective_settings().describe(nodes.size(), nodes)])
+	if groups.size() > 2:
+		lines.append("and %d more selected group(s)" % (groups.size() - 2))
+	return "\n".join(lines)
 
 
 func _group_signature(groups: Array[OctaImpostorGroup]) -> int:
@@ -295,6 +331,36 @@ func _link_settings(groups: Array[OctaImpostorGroup]) -> void:
 func _invalidate_group_info() -> void:
 	_group_key = 0
 	_queue_refresh()
+
+
+func _selected_atlases(cards: Array[Node3D]) -> Array[OctaAtlas]:
+	var out: Array[OctaAtlas] = []
+	for c in cards:
+		if c is OctaImpostor and c.atlas != null and not out.has(c.atlas):
+			out.append(c.atlas)
+	return out
+
+
+func _atlas_summary_text(atlases: Array[OctaAtlas]) -> String:
+	if atlases.is_empty():
+		return ""
+	var total := 0
+	var sides := {}
+	var lo := 1 << 30
+	var hi := 0
+	for a in atlases:
+		total += a.vram_bytes()
+		var w := a.albedo.get_width() if a.albedo else 0
+		var h := a.albedo.get_height() if a.albedo else 0
+		sides["%dx%d" % [w, h]] = true
+		lo = mini(lo, a.frame_resolution)
+		hi = maxi(hi, a.frame_resolution)
+	var px := "%d px per view" % lo if lo == hi else "%d-%d px per view" % [lo, hi]
+	var mb := total / 1048576.0
+	var amount := "%.1f MB" % mb if mb < 10.0 else "%.0f MB" % mb
+	if atlases.size() == 1:
+		return "1 atlas: %s, %s, about %s of video memory" % [sides.keys()[0], px, amount]
+	return "%d atlases: %s, %s, about %s in total" % [atlases.size(), ", ".join(sides.keys()), px, amount]
 
 
 func _atlas_text(a: OctaAtlas) -> String:

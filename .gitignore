@@ -1,7 +1,0 @@
-# Godot cache and imports
-.godot/
-*.translation
-# Test output and temporary files
-tests/out/
-tests/editor_tmp/
-octa_impostors/

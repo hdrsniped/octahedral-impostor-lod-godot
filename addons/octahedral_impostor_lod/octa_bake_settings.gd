@@ -12,7 +12,7 @@ const PRESET_TIPS := [
 	"The fastest this addon gets: Low quality, 8x8 views on a 1024 atlas, VRAM compression, no material maps, flat depth (the card does not cast or self-shadow), 1 shadow view.",
 	"For many props at once: High quality, 10x10 views on a 2048 atlas, VRAM compression, half-res material maps, 1 shadow view.",
 	"The best quality without trading much performance: High quality, 16x16 views on a 4096 atlas, lossless, full-res material maps, 2 shadow views.",
-	"Maximum quality at any cost: Ultra with precise search, split parts, back layer and 24 search steps, 16x16 views on a 4096 atlas, lossless, full-res material maps, 3 shadow views, 8x MSAA capture.",
+	"Maximum quality at any cost: every side of the object (full sphere), Ultra with precise search, 32 search steps, split parts, back layer, 32x32 views on a 4096 atlas, lossless, full-res material maps, 3 shadow views, 8x MSAA capture.",
 ]
 const COST := [1.0, 3.0, 5.0, 10.0]
 const AVERAGED_NOTE := "Material maps are off: roughness and metallic are averaged over each object's materials"
@@ -44,7 +44,7 @@ const SHORT_HINTS := {
 	"grid_size": "Views per side. More views, less detail per view.",
 	"max_atlas_size": "Atlas texture size in pixels.",
 	"output_dir": "Where baked atlases are saved.",
-	"hemisphere": "Side and top views only (half the views).",
+	"full_sphere": "Also views from below (twice the views, half the pixels each).",
 	"material_maps": "Bake roughness, metallic and AO.",
 	"emission": "Bake emission where something glows.",
 	"half_res_material_maps": "Material maps at half resolution (less memory).",
@@ -126,7 +126,7 @@ var _scan_mixed := false
 @export_range(1.0, 100.0, 0.5, "suffix:%") var scene_pick_percent := 10.0
 ## Joined impostors are grouped in squares this size (meters), so off-screen groups can be skipped.
 @export_range(5.0, 500.0, 0.5, "or_greater", "suffix:m") var join_cell := 50.0
-## Split each Join Cell into smaller regions (a median split until a region is within the size and count limits) and order the instances of every group along a Z-order curve. Each joined group gets a small bounding box, so off-screen regions are skipped as a whole. Off = one group per cell in the order of the cards, as in v2.1.
+## Split each Join Cell into smaller regions (a median split until a region is within the size and count limits) and order the instances of every group along a Z-order curve. Each joined group gets a small bounding box, so off-screen regions are skipped as a whole. Off = one group per cell in the order of the cards.
 @export var join_adaptive := false
 ## Adaptive join: a region is split until its instances span at most this size on every axis (meters, measured between the card centers).
 @export_range(2.0, 200.0, 0.5, "or_greater", "suffix:m") var join_region_size := 20.0
@@ -137,11 +137,15 @@ var _scan_mixed := false
 ## Views per side for each object (grid_size² views). More views = smoother
 ## rotation but fewer pixels per view.
 @export_range(2, 32) var grid_size := 12
-## Capture only views from above and the side (rocks, trees, buildings): twice
-## the detail. Turn off for objects you also see from below (ships, floating things).
-@export var hemisphere := true
+## Also capture views from below (twice the views, so each view gets half the
+## pixels at the same atlas size). Only needed for objects you can look up at, such as
+## ships and floating things. Off = top and side views only, twice the detail.
+@export var full_sphere := false
 ## Atlas width/height in pixels. Bigger = sharper cards and more video memory.
-@export_enum("256:256", "512:512", "1024:1024", "2048:2048", "2896:2896", "4096:4096", "8192:8192") var max_atlas_size := 2048
+## 4096 is the largest that bakes reliably; 8192 atlases crash the capture.
+@export_enum("256:256", "512:512", "1024:1024", "2048:2048", "2896:2896", "4096:4096") var max_atlas_size := 2048:
+	set(v):
+		max_atlas_size = mini(v, 4096)
 ## Also capture roughness, metallic and ambient occlusion per pixel from the source
 ## materials (one more atlas texture). Off = one roughness/metallic value per object, averaged
 ## over its materials (objects that mix shiny and rough materials lose that difference).
@@ -201,8 +205,8 @@ static func preset_values(p: Preset) -> Dictionary:
 		Preset.FAST: {quality = OctaAtlas.Quality.HIGH, grid_size = 10, max_atlas_size = 2048, compression = Compression.VRAM},
 		Preset.QUALITY: {quality = OctaAtlas.Quality.HIGH, grid_size = 16, max_atlas_size = 4096, compression = Compression.LOSSLESS,
 				half_res_material_maps = false, shadow_views = 2},
-		Preset.MAX: {quality = OctaAtlas.Quality.ULTRA, grid_size = 16, max_atlas_size = 4096, compression = Compression.LOSSLESS,
-				split_parts = true, back_layer = true, precise_search = true, search_steps = 24, hemisphere = true,
+		Preset.MAX: {quality = OctaAtlas.Quality.ULTRA, grid_size = 32, max_atlas_size = 4096, compression = Compression.LOSSLESS,
+				split_parts = true, back_layer = true, precise_search = true, search_steps = 32, full_sphere = true,
 				half_res_material_maps = false, shadow_views = 3, msaa = Viewport.MSAA_8X},
 	}.get(p, {})
 	if v.is_empty():
@@ -255,7 +259,7 @@ func _scan(sources: Array) -> void:
 	_scan_mixed = OctaBaker.has_mixed_constants(sources, split_parts)
 
 
-func describe(count: int, sources: Array = []) -> String:
+func describe(count: int, sources: Array = [], with_warnings := true) -> String:
 	var l := layout(count)
 	var layer := float(l.side * l.side) * (1.0 if compression == Compression.VRAM else 4.0) * 4.0 / 3.0
 	var map_scale := 0.25 if half_res_material_maps else 1.0
@@ -272,4 +276,18 @@ func describe(count: int, sources: Array = []) -> String:
 		notes += " (parallax refine)"
 	if averages_materials(sources):
 		notes += " (%s)" % AVERAGED_NOTE
-	return "%d object(s) -> %dx%d atlas, %d px per view, ~%.0f MB of video memory%s" % [count, l.cols * grid_size * l.frame, l.rows * grid_size * l.frame, l.frame, bytes / 1048576.0, notes]
+	var warnings := PackedStringArray()
+	if with_warnings and precise_search and quality < OctaAtlas.Quality.ULTRA:
+		warnings.append("Precise search is ignored below Ultra.")
+	if with_warnings and coverage_pyramid and precise_search:
+		warnings.append("Coverage pyramid is baked but unused while precise search is on.")
+	if with_warnings and parallax_refine and quality >= OctaAtlas.Quality.HIGH:
+		warnings.append("Parallax refine only applies below High.")
+	if with_warnings and not write_depth:
+		warnings.append("Depth writing is off: the card does not cast or self-shadow.")
+	if with_warnings and l.frame < 32:
+		warnings.append("Atlas is crowded at %d px per view: raise max_atlas_size or bake fewer objects." % l.frame)
+	var text := "%d object(s) -> %dx%d atlas, %d px per view, ~%.0f MB of video memory%s" % [count, l.cols * grid_size * l.frame, l.rows * grid_size * l.frame, l.frame, bytes / 1048576.0, notes]
+	if not warnings.is_empty():
+		text += " " + " ".join(warnings)
+	return text

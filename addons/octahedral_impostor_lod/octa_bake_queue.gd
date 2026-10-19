@@ -4,7 +4,7 @@ extends Node
 signal baked(source: Node3D, card: Node3D)
 signal finished
 
-const KEY_PROPERTIES := ["grid_size", "hemisphere", "max_atlas_size", "material_maps", "emission", "half_res_material_maps", "split_parts",
+const KEY_PROPERTIES := ["grid_size", "full_sphere", "max_atlas_size", "material_maps", "emission", "half_res_material_maps", "split_parts",
 		"back_layer", "search_steps", "layer_tolerance", "frame_resolution", "msaa", "padding_px", "write_depth", "precise_search", "shadow_views", "compression",
 		"view_visibility", "coverage_pyramid", "parallax_refine"]
 

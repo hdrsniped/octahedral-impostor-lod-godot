@@ -52,7 +52,7 @@ static func attach_card(source: Node3D, atlas: OctaAtlas, index: int, mode := Mo
 		card.name = String(source.name) + "_OctaImpostor"
 		card.transform = atlas.card_transform(source)
 		source.get_parent().add_child(card, true)
-	card.set_meta(SOURCE_META, card.get_path_to(source))
+	card.set_meta(SOURCE_META, card.get_path_to(source) if source.is_inside_tree() and card.is_inside_tree() else NodePath())
 	card.set_meta(MODE_META, mode)
 	if settings != null:
 		card.configure(settings, world_scale(card))

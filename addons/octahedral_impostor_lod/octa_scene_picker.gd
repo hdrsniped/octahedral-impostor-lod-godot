@@ -5,6 +5,7 @@ signal chosen(nodes: Array)
 
 var _tree: Tree
 var _percent: SpinBox
+var _hint: Label
 var _rows: Array[TreeItem] = []
 var _settings: OctaBakeSettings
 
@@ -12,9 +13,10 @@ var _settings: OctaBakeSettings
 func _init() -> void:
 	title = "Bake Scene"
 	ok_button_text = "Bake Checked"
-	min_size = Vector2i(Vector2(620, 480) * EditorInterface.get_editor_scale())
+	min_size = Vector2i(420, 320)
 	var box := VBoxContainer.new()
 	var help := Label.new()
+	_hint = help
 	help.text = "Ticked objects are baked. By default the ones that cover less than the percentage below of the screen height at the LOD distance are ticked, so big hero objects stay as real meshes. A group appears as one item and is baked with its own settings. Objects that already have impostors are never ticked."
 	help.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	box.add_child(help)
@@ -43,6 +45,18 @@ func _init() -> void:
 	box.add_child(_tree)
 	add_child(box)
 	confirmed.connect(_on_confirmed)
+
+
+func fit_to_editor(view: Vector2) -> Vector2i:
+	var w := minf(clampf(view.x * 0.66, 460.0, 760.0), maxf(view.x - 32.0, 280.0))
+	var h := minf(maxf(view.y * 0.72, 320.0), 720.0)
+	h = minf(h, maxf(view.y - 48.0, 220.0))
+	var target := Vector2i(int(w), int(h))
+	max_size = target
+	size = target
+	_hint.size = Vector2(maxf(w - 48.0, 240.0), _hint.size.y)
+	_hint.get_minimum_size()
+	return target
 
 
 func populate(root: Node, s: OctaBakeSettings) -> void:

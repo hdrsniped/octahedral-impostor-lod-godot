@@ -3,12 +3,18 @@ extends EditorPlugin
 
 enum { BAKE, REMOVE, CHECK, SCENE, JOIN, REBAKE, HELP, GROUP, REBAKE_ALL, SELECT_ALL, PACK }
 
+const BAKE_VIEW := preload("res://addons/octahedral_impostor_lod/octa_bake_view.gd")
+const DIALOG_WIDTH := 700.0
+const DIALOG_HEIGHT_RATIO := 0.72
+const DIALOG_MAX_HEIGHT := 720.0
+const DIALOG_MIN_HEIGHT := 320.0
+
 const HELP_TEXT := """[b]Menu (3D toolbar)[/b]
-[b]Bake Selected...[/b]  Bake the selected objects with the dialog settings. Pick a preset, then change anything (hover an option for help).
+[b]Bake Selected...[/b]  Bake the selected objects with the dialog settings. Pick a preset, then change anything (hover an option for help). All options in the dialog header shows the full inspector; the short form keeps what a bake needs.
 [b]Bake Scene...[/b]  Checklist of every object with its on-screen size; small ones are pre-ticked. A group is one item.
 [b]Bake Group[/b]  Bake the selected OctaImpostorGroup with its own settings. With a Chunk LOD distance on the group, one extra card of the whole group is baked for beyond that distance and the object cards stop there.
 [b]Re-bake Selected / Re-bake All Impostors in Scene[/b]  Bake again with the settings saved in each atlas (or its group). Properties you changed on a card are kept.
-[b]Join Selected Impostors[/b]  Merge nearby cards of one object into MultiMeshes, one per Join Cell (one draw call each). Adaptive Join (bake dialog, Scene and joining) also splits crowded cells into small regions in Z-order, so off-screen regions are skipped. Joined groups have no LOD distance: their real meshes are hidden and the impostors stay on at every distance (undo restores the meshes).
+[b]Join Selected Impostors[/b]  Merge nearby cards of one object into MultiMeshes, one per Join Cell (one draw call each). It needs several copies of the same baked card: bake the object once and duplicate the card, because two objects baked separately are two different entries in the atlas. Adaptive Join (bake dialog, Scene and joining) also splits crowded cells into small regions in Z-order, so off-screen regions are skipped. Joined groups have no LOD distance: their real meshes are hidden and the impostors stay on at every distance (undo restores the meshes).
 [b]Pack Selected Atlases...[/b]  Merge the atlases of the selected cards into shared ones without re-baking (same grid, view size, padding and options). Cards then share one material per quality and can be joined. Undoable.
 [b]Remove Impostors from Selected[/b]  Delete cards and restore the real objects.
 [b]Check Quality of Selected[/b]  Compare card and real mesh from 8 angles.
@@ -32,8 +38,11 @@ OctaBakeQueue.shared(get_tree()).enqueue(node) bakes at runtime within a frame b
 var _menu: MenuButton
 var _dialog: ConfirmationDialog
 var _info: Label
+var _info_scroll: ScrollContainer
 var _preset: OptionButton
+var _advanced: CheckButton
 var _inspector: EditorInspector
+var _view: Resource
 var _progress: AcceptDialog
 var _progress_bar: ProgressBar
 var _progress_label: Label
@@ -44,6 +53,7 @@ var _help: AcceptDialog
 var _settings := OctaBakeSettings.new()
 var _busy := false
 var _save_queued := false
+var _dock_scroll: ScrollContainer
 
 
 # --- Menu and dialog ---
@@ -74,7 +84,7 @@ func _enter_tree() -> void:
 	_dialog = ConfirmationDialog.new()
 	_dialog.title = "Bake Octahedral Impostors"
 	_dialog.ok_button_text = "Bake"
-	_dialog.min_size = Vector2i(Vector2(460, 560) * EditorInterface.get_editor_scale())
+	_dialog.min_size = Vector2i(420, 320)
 	var box := VBoxContainer.new()
 	var row := HBoxContainer.new()
 	var pl := Label.new()
@@ -88,33 +98,53 @@ func _enter_tree() -> void:
 	_preset.tooltip_text = "Fills in quality, atlas, depth, fade, shadow and complex-shape options for a typical use. It never changes the placement (mode, LOD distance). Change anything afterwards."
 	_preset.item_selected.connect(_on_preset)
 	row.add_child(_preset)
+	_advanced = CheckButton.new()
+	_advanced.text = "All options"
+	_advanced.tooltip_text = "Show every bake option, including the rare ones. Off shows only the settings needed for a good bake."
+	_advanced.toggled.connect(_on_advanced)
+	row.add_child(_advanced)
+
 	box.add_child(row)
+	_info_scroll = ScrollContainer.new()
+	_info_scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	_info_scroll.vertical_scroll_mode = ScrollContainer.SCROLL_MODE_AUTO
+	box.add_child(_info_scroll)
 	_info = Label.new()
 	_info.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	box.add_child(_info)
+	_info.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_info_scroll.add_child(_info)
 	_inspector = EditorInspector.new()
 	_inspector.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	_inspector.vertical_scroll_mode = ScrollContainer.SCROLL_MODE_SHOW_ALWAYS
 	_inspector.property_edited.connect(func(p: String) -> void:
 		if _preset_owns(p):
 			_preset.select(0)
 		_queue_save()
 		_update_info()
-		_apply_hints.call_deferred())
+		_hints_later())
 	box.add_child(_inspector)
 	_dialog.add_child(box)
 	_dialog.confirmed.connect(_bake)
 	EditorInterface.get_base_control().add_child(_dialog)
 	_load_settings()
 	_preset.select(_matching_preset())
-	_inspector.edit(_settings)
-	_apply_hints.call_deferred()
+	_view = BAKE_VIEW.new()
+	_view.settings = _settings
+	_inspector.edit(_view)
+	_hints_later()
 	_build_progress()
 	_build_help()
 	_picker = preload("res://addons/octahedral_impostor_lod/octa_scene_picker.gd").new()
 	_picker.chosen.connect(_on_picked)
 	EditorInterface.get_base_control().add_child(_picker)
 	_dock = preload("res://addons/octahedral_impostor_lod/octa_dock.gd").new(self)
-	add_control_to_dock(DOCK_SLOT_RIGHT_UL, _dock)
+	_dock_scroll = ScrollContainer.new()
+	_dock_scroll.name = "Impostors"
+	_dock_scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	_dock_scroll.vertical_scroll_mode = ScrollContainer.SCROLL_MODE_SHOW_ALWAYS
+	_dock.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_dock_scroll.add_child(_dock)
+	add_control_to_dock(DOCK_SLOT_RIGHT_UL, _dock_scroll)
 
 
 func _exit_tree() -> void:
@@ -126,7 +156,8 @@ func _exit_tree() -> void:
 	_progress.queue_free()
 	_picker.queue_free()
 	_help.queue_free()
-	remove_control_from_docks(_dock)
+	remove_control_from_docks(_dock_scroll)
+	_dock_scroll.queue_free()
 	_dock.queue_free()
 
 
@@ -140,8 +171,11 @@ func _on_menu(id: int) -> void:
 			elif _selected().is_empty():
 				_toast("Select one or more 3D objects with meshes first.", EditorToaster.SEVERITY_WARNING)
 			else:
+				var target := _dialog_target()
+				_dialog.max_size = target
+				_dialog.size = target
 				_update_info()
-				_dialog.popup_centered()
+				_dialog.popup_centered_clamped(target, 0.9)
 		SCENE:
 			open_scene_picker()
 		REMOVE:
@@ -161,7 +195,7 @@ func _on_menu(id: int) -> void:
 		CHECK:
 			_check()
 		HELP:
-			_help.popup_centered()
+			_open_help()
 
 
 func _selected() -> Array[Node3D]:
@@ -186,16 +220,63 @@ func _update_info() -> void:
 	if nodes.size() > 5:
 		names += ", ..."
 	_info.text = "Selected: %s\n%s\n%s" % [names, _settings.describe(nodes.size(), nodes), _settings.cost_text(nodes)]
+	if not _dialog.visible:
+		_shape_info()
+
+
+func _dialog_target() -> Vector2i:
+	var editor := EditorInterface.get_base_control().get_viewport_rect().size
+	var w := minf(clampf(editor.x * 0.66, 460.0, DIALOG_WIDTH), maxf(editor.x - 32.0, 260.0))
+	var h := minf(maxf(editor.y * DIALOG_HEIGHT_RATIO, DIALOG_MIN_HEIGHT), DIALOG_MAX_HEIGHT)
+	h = minf(h, maxf(editor.y - 48.0, 200.0))
+	return Vector2i(int(w), int(h))
+
+
+func _shape_info() -> void:
+	var line := maxf(_info.get_line_height(), 1.0)
+	var lines := maxi(3, int(_dialog.size.y * 0.40 / line))
+	_info_scroll.custom_minimum_size = Vector2(0.0, lines * line)
+	_info.size = Vector2(maxf(_dialog.size.x - 40.0, 200.0), _info.size.y)
+	_info.get_minimum_size()
 
 
 func _on_preset(i: int) -> void:
 	_settings.apply_preset(i)
-	_inspector.edit(null)
-	_inspector.edit(_settings)
-	_apply_hints.call_deferred()
+	_refresh_edit()
 	_update_info()
 	if i != OctaBakeSettings.Preset.CUSTOM:
 		_queue_save()
+
+
+func _refresh_edit() -> void:
+	_inspector.edit(null)
+	_inspector.edit(_settings if _advanced.button_pressed else _view)
+	_hints_later()
+
+
+func _hints_later() -> void:
+	_apply_hints.call_deferred()
+	_hints_next.call_deferred()
+
+
+func _hints_next() -> void:
+	await get_tree().process_frame
+	_apply_hints()
+	await get_tree().process_frame
+	_apply_hints()
+
+
+func _on_advanced(_on: bool) -> void:
+	_refresh_edit()
+
+
+func set_advanced(on: bool) -> void:
+	_advanced.set_pressed_no_signal(on)
+	_on_advanced(on)
+
+
+func is_advanced() -> bool:
+	return _advanced.button_pressed
 
 
 func _matching_preset() -> int:
@@ -261,15 +342,22 @@ func _build_help() -> void:
 	_help = AcceptDialog.new()
 	_help.title = "Octahedral Impostor LOD - Help"
 	_help.ok_button_text = "Close"
-	_help.min_size = Vector2i(Vector2(620, 560) * EditorInterface.get_editor_scale())
+	_help.min_size = Vector2i(420, 320)
 	var text := RichTextLabel.new()
 	text.bbcode_enabled = true
 	text.text = HELP_TEXT.replace("\r", "")
 	text.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	_help.add_child(text)
-	_help.add_button("Open README", false, "readme")
-	_help.custom_action.connect(func(_a: StringName) -> void: OS.shell_open(ProjectSettings.globalize_path("res://addons/octahedral_impostor_lod/README.md")))
+	_help.add_button("Open on GitHub", false, "readme")
+	_help.custom_action.connect(func(_a: StringName) -> void: OS.shell_open("https://github.com/hdrsniped/octahedral-impostor-lod-godot"))
 	EditorInterface.get_base_control().add_child(_help)
+
+
+func _open_help() -> void:
+	var target := _dialog_target()
+	_help.max_size = target
+	_help.size = target
+	_help.popup_centered_clamped(target, 0.9)
 
 
 func _register_settings() -> void:
@@ -510,7 +598,7 @@ func _run_bake(nodes: Array[Node3D], s: OctaBakeSettings, group: OctaImpostorGro
 	for k in replaced.size():
 		_remove_undo_actions(ur, old_sources[k], replaced[k])
 	ur.commit_action()
-	_toast("Baked %d object(s) into %s (%s)." % [bake_list.size(), path, s.describe(bake_list.size()).get_slice(" -> ", 1)])
+	_toast("Baked %d object(s) into %s (%s)." % [bake_list.size(), path, s.describe(bake_list.size(), [], false).get_slice(" -> ", 1)])
 	if group != null and group.chunk_lod_distance > 0.0:
 		if chunk_atlas == null:
 			_toast("The chunk card bake failed; the object cards were baked. See the Output panel.", EditorToaster.SEVERITY_WARNING)
@@ -615,6 +703,8 @@ func join_cards(cards: Array) -> void:
 	if root == null:
 		return
 	var groups := {}
+	var by_object := {}
+	var atlases := {}
 	for c in cards:
 		if c is OctaImpostor and c.atlas != null and c.is_inside_tree():
 			var cell := Vector3i((c.global_position / _settings.join_cell).floor())
@@ -622,6 +712,9 @@ func join_cards(cards: Array) -> void:
 			if not groups.has(key):
 				groups[key] = []
 			groups[key].append(c)
+			var obj_key := "%d|%d" % [c.atlas.get_instance_id(), c.object_index]
+			by_object[obj_key] = int(by_object.get(obj_key, 0)) + 1
+			atlases[c.atlas.get_instance_id()] = true
 	var ur := get_undo_redo()
 	ur.create_action("Join Impostors")
 	var draw_calls := 0
@@ -662,10 +755,19 @@ func join_cards(cards: Array) -> void:
 		draw_calls += 1
 		joined += g.size()
 	if draw_calls == 0:
-		_toast("Select at least two impostors of the same object that are close together to join them.", EditorToaster.SEVERITY_WARNING)
+		var near := false
+		for k in by_object:
+			if by_object[k] >= 2:
+				near = true
+		if near:
+			_toast("Same-object cards must sit within %.0f m (Join Cell)." % _settings.join_cell, EditorToaster.SEVERITY_WARNING)
+		elif atlases.size() > 1:
+			_toast("These cards are in different atlases. Bake the objects together, then join.", EditorToaster.SEVERITY_WARNING)
+		else:
+			_toast("Each object is its own atlas entry. Bake them together, or duplicate one card.", EditorToaster.SEVERITY_WARNING)
 		return
 	ur.commit_action()
-	_toast("Joined %d impostor(s) into %d draw call(s). Their real meshes are hidden; undo restores them." % [joined, draw_calls])
+	_toast("Joined %d cards into %d draw calls. Undo restores them." % [joined, draw_calls])
 	_dock.refresh()
 
 
@@ -678,7 +780,7 @@ func pack_atlases(cards: Array) -> bool:
 		if c.atlas != null and not sources.has(c.atlas):
 			sources.append(c.atlas)
 	if sources.size() < 2:
-		_toast("Select impostors that use at least two different atlases to pack them into one.", EditorToaster.SEVERITY_WARNING)
+		_toast("Select cards from at least two different atlases.", EditorToaster.SEVERITY_WARNING)
 		return false
 	var limit := 4096
 	for a: OctaAtlas in sources:
@@ -686,7 +788,13 @@ func pack_atlases(cards: Array) -> bool:
 	var map := {}
 	var packed := OctaPacker.pack(sources, limit, map)
 	if map.is_empty():
-		_toast("These atlases cannot be packed together: they differ in format, grid size, view size, padding, maps or atlas options.", EditorToaster.SEVERITY_WARNING)
+		var why := "the layout"
+		for i in range(1, sources.size()):
+			var m := OctaPacker.mismatch(sources[0], sources[i])
+			if not m.is_empty():
+				why = m
+				break
+		_toast("Cannot pack: %s differs." % why, EditorToaster.SEVERITY_WARNING)
 		return false
 	var created: Array = []
 	for s in map:
@@ -719,7 +827,7 @@ func pack_atlases(cards: Array) -> bool:
 	for pa: OctaAtlas in created:
 		ur.add_do_reference(pa)
 	ur.commit_action()
-	_toast("Packed %d atlas(es) into %d shared atlas(es); %d card(s) now share one material per quality." % [sources.size(), packed.size(), moved])
+	_toast("Packed %d atlases into %d; %d cards now share one material." % [sources.size(), packed.size(), moved])
 	_dock.refresh()
 	EditorInterface.mark_scene_as_unsaved()
 	return true
@@ -766,7 +874,8 @@ func open_scene_picker() -> void:
 		_toast("Open a scene first.", EditorToaster.SEVERITY_WARNING)
 		return
 	_picker.populate(root, _settings)
-	_picker.popup_centered()
+	var target: Vector2i = _picker.fit_to_editor(EditorInterface.get_base_control().get_viewport_rect().size)
+	_picker.popup_centered_clamped(target, 0.9)
 
 
 func _on_picked(nodes: Array) -> void:
@@ -850,6 +959,8 @@ func _save_settings() -> void:
 
 func _load_settings() -> void:
 	var d: Dictionary = EditorInterface.get_editor_settings().get_project_metadata("octa_lod", "bake_settings", {})
+	if d.has("hemisphere") and not d.has("full_sphere"):
+		_settings.full_sphere = not bool(d["hemisphere"])
 	for p in _stored_properties():
 		if d.has(p):
 			_settings.set(p, d[p])

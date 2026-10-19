@@ -6,26 +6,36 @@ const MAX_SIDE := 16384
 
 # --- Compatibility ---
 static func compatible(a: OctaAtlas, b: OctaAtlas) -> bool:
+	return mismatch(a, b).is_empty()
+
+
+static func mismatch(a: OctaAtlas, b: OctaAtlas) -> String:
 	if a == null or b == null:
-		return false
+		return "a missing atlas"
 	if a.format_version != b.format_version:
-		return false
-	if a.grid_size != b.grid_size or a.frame_resolution != b.frame_resolution:
-		return false
-	if not is_equal_approx(a.frame_scale, b.frame_scale) or a.hemisphere != b.hemisphere:
-		return false
+		return "the atlas format"
+	if a.grid_size != b.grid_size:
+		return "the grid size"
+	if a.frame_resolution != b.frame_resolution:
+		return "the view size"
+	if not is_equal_approx(a.frame_scale, b.frame_scale):
+		return "the padding"
+	if a.hemisphere != b.hemisphere:
+		return "the full sphere mode"
 	if a.write_depth != b.write_depth or a.precise_search != b.precise_search:
-		return false
+		return "the depth or search option"
 	if a.view_visibility != b.view_visibility or a.pyramid_search != b.pyramid_search or a.parallax_refine != b.parallax_refine:
-		return false
+		return "a shading option"
 	if a.shadow_views != b.shadow_views:
-		return false
-	return tile_shape(a.albedo, a) == tile_shape(b.albedo, b) \
-			and tile_shape(a.normal_depth, a) == tile_shape(b.normal_depth, b) \
-			and tile_shape(a.orm, a) == tile_shape(b.orm, b) \
-			and tile_shape(a.emission, a) == tile_shape(b.emission, b) \
-			and tile_shape(a.back_depth, a) == tile_shape(b.back_depth, b) \
-			and tile_shape(a.max_coverage, a) == tile_shape(b.max_coverage, b)
+		return "the shadow views"
+	if tile_shape(a.albedo, a) != tile_shape(b.albedo, b) \
+			or tile_shape(a.normal_depth, a) != tile_shape(b.normal_depth, b) \
+			or tile_shape(a.orm, a) != tile_shape(b.orm, b) \
+			or tile_shape(a.emission, a) != tile_shape(b.emission, b) \
+			or tile_shape(a.back_depth, a) != tile_shape(b.back_depth, b) \
+			or tile_shape(a.max_coverage, a) != tile_shape(b.max_coverage, b):
+		return "the maps"
+	return ""
 
 
 static func tile_shape(tex: Texture2D, atlas: OctaAtlas) -> Vector2i:
